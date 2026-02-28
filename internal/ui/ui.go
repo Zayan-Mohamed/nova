@@ -1,0 +1,1175 @@
+// Package ui implements the NOVA terminal user interface using BubbleTea
+// and Lipgloss. The TUI is keyboard-driven with clearly documented bindings,
+// no hidden actions, and no destructive operations without confirmation.
+// All scan operations run asynchronously so the UI never freezes.
+package ui
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Zayan-Mohamed/nova/internal/risk"
+	"github.com/Zayan-Mohamed/nova/internal/scanner"
+	"github.com/Zayan-Mohamed/nova/internal/wifi"
+)
+
+// ─── View states ──────────────────────────────────────────────────────────────
+
+type viewState int
+
+const (
+	viewConsent    viewState = iota // legal consent screen
+	viewMainMenu                    // main navigation menu
+	viewWiFi                        // WiFi scan results
+	viewHosts                       // LAN host discovery results
+	viewHostDetail                  // single-host port/risk detail
+	viewHelp                        // key bindings
+)
+
+// ─── Async message types ─────────────────────────────────────────────────────
+
+// wifiScanDoneMsg is sent when a WiFi scan completes.
+type wifiScanDoneMsg struct {
+	reports []risk.NetworkReport
+	err     error
+}
+
+// hostScanDoneMsg is sent when a LAN host discovery completes.
+type hostScanDoneMsg struct {
+	reports []risk.HostReport
+	err     error
+}
+
+// portScanDoneMsg is sent when a port scan of a single host completes.
+type portScanDoneMsg struct {
+	ip    string
+	ports []scanner.Port
+	err   error
+}
+
+// tickMsg drives the loading animation.
+type tickMsg time.Time
+
+// ─── Model ────────────────────────────────────────────────────────────────────
+
+// Model holds the complete TUI state.
+type Model struct {
+	// layout
+	width  int
+	height int
+
+	// view state
+	state viewState
+
+	// consent
+	consentAccepted bool
+
+	// menus
+	menuCursor int
+	menuItems  []string
+
+	// wifi
+	wifiReports []risk.NetworkReport
+	wifiCursor  int
+	wifiLoading bool
+	wifiError   string
+
+	// hosts
+	hostReports []risk.HostReport
+	hostCursor  int
+	hostLoading bool
+	hostError   string
+	hostCIDR    string
+
+	// host detail (port scan)
+	selectedHost *risk.HostReport
+	portLoading  bool
+	portError    string
+
+	// general
+	statusMsg string
+	spinner   int // 0-3 for spinner frames
+	isRoot    bool
+}
+
+// menuItems list — index must stay stable; append-only.
+var mainMenuItems = []string{
+	"WiFi Analysis",
+	"LAN Host Discovery",
+	"Help",
+	"Quit",
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+var (
+	colorPrimary  = lipgloss.Color("#7B68EE") // medium slate blue
+	colorAccent   = lipgloss.Color("#00D7FF") // cyan
+	colorAccent2  = lipgloss.Color("#FF79C6") // pink
+	colorTitle    = lipgloss.Color("#BD93F9") // lavender
+	colorMuted    = lipgloss.Color("#6272A4") // muted blue-grey
+	colorFaint    = lipgloss.Color("#44475A") // very muted
+	colorSuccess  = lipgloss.Color("#50FA7B") // green
+	colorWarn     = lipgloss.Color("#FFB86C") // orange
+	colorDanger   = lipgloss.Color("#FF5555") // red
+	colorSelected = lipgloss.Color("#00D7FF") // cyan (matches accent)
+	colorBg       = lipgloss.Color("#282A36") // dark bg (dracula)
+
+	styleTitle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(colorTitle).
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(colorPrimary).
+			Padding(0, 3)
+
+	styleSubtitle = lipgloss.NewStyle().
+			Foreground(colorMuted).
+			Italic(true)
+
+	styleSelected = lipgloss.NewStyle().
+			Foreground(colorSelected).
+			Bold(true)
+
+	styleNormal = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F8F8F2"))
+
+	styleMuted = lipgloss.NewStyle().
+			Foreground(colorMuted)
+
+	styleFaint = lipgloss.NewStyle().
+			Foreground(colorFaint)
+
+	styleSuccess = lipgloss.NewStyle().
+			Foreground(colorSuccess).
+			Bold(true)
+
+	styleDanger = lipgloss.NewStyle().
+			Foreground(colorDanger).
+			Bold(true)
+
+	styleWarn = lipgloss.NewStyle().
+			Foreground(colorWarn).
+			Bold(true)
+
+	styleAccent = lipgloss.NewStyle().
+			Foreground(colorAccent).
+			Bold(true)
+
+	styleAccent2 = lipgloss.NewStyle().
+			Foreground(colorAccent2).
+			Bold(true)
+
+	styleBox = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(colorPrimary).
+			Padding(1, 3)
+
+	styleStatusBar = lipgloss.NewStyle().
+			Foreground(colorMuted).
+			BorderTop(true).
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderForeground(colorFaint)
+
+	styleHelp = lipgloss.NewStyle().
+			Foreground(colorMuted)
+
+	// Menu item styles.
+	styleMenuBox = lipgloss.NewStyle().
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(colorFaint).
+			Padding(0, 2)
+
+	styleMenuBoxSelected = lipgloss.NewStyle().
+				BorderStyle(lipgloss.RoundedBorder()).
+				BorderForeground(colorAccent).
+				Padding(0, 2)
+)
+
+// spinnerFrames are the frames for the loading animation.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// novaASCII is the NOVA ASCII art logo (7 lines × ~46 chars wide).
+const novaASCII = `
+ ███╗   ██╗ ██████╗ ██╗   ██╗ █████╗ 
+ ████╗  ██║██╔═══██╗██║   ██║██╔══██╗
+ ██╔██╗ ██║██║   ██║██║   ██║███████║
+ ██║╚██╗██║██║   ██║╚██╗ ██╔╝██╔══██║
+ ██║ ╚████║╚██████╔╝ ╚████╔╝ ██║  ██║
+ ╚═╝  ╚═══╝ ╚═════╝   ╚═══╝  ╚═╝  ╚═╝`
+
+// center places s horizontally in a field of width w.
+func center(s string, w int) string {
+	return lipgloss.NewStyle().Width(w).Align(lipgloss.Center).Render(s)
+}
+
+// centerBlock renders a multi-line block centred in width w.
+func centerBlock(lines []string, w int) string {
+	for i, l := range lines {
+		lines[i] = center(l, w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// vcenter pads the top so that content appears vertically centred.
+func vcenter(content string, totalHeight, contentHeight int) string {
+	pad := (totalHeight - contentHeight) / 2
+	if pad < 0 {
+		pad = 0
+	}
+	var sb strings.Builder
+	for i := 0; i < pad; i++ {
+		sb.WriteString("\n")
+	}
+	sb.WriteString(content)
+	return sb.String()
+}
+
+// ─── Constructor ─────────────────────────────────────────────────────────────
+
+// NewModel creates a new TUI model. isRoot indicates whether the process has
+// root privileges (affects scan type offered to the user).
+func NewModel(isRoot bool, hostCIDR string) Model {
+	return Model{
+		state:     viewConsent,
+		menuItems: mainMenuItems,
+		isRoot:    isRoot,
+		hostCIDR:  hostCIDR,
+	}
+}
+
+// ─── BubbleTea interface ──────────────────────────────────────────────────────
+
+// Init starts the loading spinner tick.
+func (m Model) Init() tea.Cmd {
+	return tickCmd()
+}
+
+// Update processes incoming messages and updates the model.
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+
+	// ── Window size ──
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+
+	// ── Spinner tick ──
+	case tickMsg:
+		m.spinner = (m.spinner + 1) % len(spinnerFrames)
+		return m, tickCmd()
+
+	// ── WiFi scan result ──
+	case wifiScanDoneMsg:
+		m.wifiLoading = false
+		if msg.err != nil {
+			m.wifiError = msg.err.Error()
+		} else {
+			m.wifiReports = msg.reports
+			m.wifiError = ""
+			m.wifiCursor = 0
+		}
+		return m, nil
+
+	// ── Host discovery result ──
+	case hostScanDoneMsg:
+		m.hostLoading = false
+		if msg.err != nil {
+			m.hostError = msg.err.Error()
+		} else {
+			m.hostReports = msg.reports
+			m.hostError = ""
+			m.hostCursor = 0
+		}
+		return m, nil
+
+	// ── Port scan result ──
+	case portScanDoneMsg:
+		m.portLoading = false
+		if msg.err != nil {
+			m.portError = msg.err.Error()
+		} else if m.selectedHost != nil {
+			// Rebuild the host report with the freshly scanned ports.
+			updated := m.selectedHost.Host
+			updated.OpenPorts = msg.ports
+			newReport := risk.AnalyseHost(updated)
+			m.selectedHost = &newReport
+			m.portError = ""
+		}
+		return m, nil
+
+	// ── Keyboard ──
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+
+	return m, nil
+}
+
+// handleKey processes keyboard input for the current view state.
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Global quit bindings.
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
+
+	switch m.state {
+
+	// ── Consent screen ──
+	case viewConsent:
+		switch key {
+		case "y", "Y":
+			m.consentAccepted = true
+			m.state = viewMainMenu
+		case "n", "N", "q", "Q":
+			return m, tea.Quit
+		}
+
+	// ── Main menu ──
+	case viewMainMenu:
+		switch key {
+		case "up", "k":
+			if m.menuCursor > 0 {
+				m.menuCursor--
+			}
+		case "down", "j":
+			if m.menuCursor < len(m.menuItems)-1 {
+				m.menuCursor++
+			}
+		case "enter", " ":
+			return m.activateMenuItem()
+		case "q":
+			return m, tea.Quit
+		}
+
+	// ── WiFi view ──
+	case viewWiFi:
+		switch key {
+		case "up", "k":
+			if m.wifiCursor > 0 {
+				m.wifiCursor--
+			}
+		case "down", "j":
+			if m.wifiCursor < len(m.wifiReports)-1 {
+				m.wifiCursor++
+			}
+		case "r":
+			// Re-scan.
+			m.wifiLoading = true
+			m.wifiError = ""
+			return m, runWiFiScan()
+		case "esc", "q":
+			m.state = viewMainMenu
+		}
+
+	// ── Host list view ──
+	case viewHosts:
+		switch key {
+		case "up", "k":
+			if m.hostCursor > 0 {
+				m.hostCursor--
+			}
+		case "down", "j":
+			if m.hostCursor < len(m.hostReports)-1 {
+				m.hostCursor++
+			}
+		case "enter", " ":
+			if len(m.hostReports) > 0 {
+				report := m.hostReports[m.hostCursor]
+				m.selectedHost = &report
+				m.state = viewHostDetail
+				m.portLoading = true
+				m.portError = ""
+				return m, runPortScan(report.Host.IP, m.isRoot)
+			}
+		case "r":
+			// Re-scan.
+			m.hostLoading = true
+			m.hostError = ""
+			return m, runHostScan(m.hostCIDR, m.isRoot)
+		case "esc", "q":
+			m.state = viewMainMenu
+		}
+
+	// ── Host detail view ──
+	case viewHostDetail:
+		switch key {
+		case "esc", "q":
+			m.state = viewHosts
+			m.selectedHost = nil
+			m.portError = ""
+		}
+
+	// ── Help view ──
+	case viewHelp:
+		switch key {
+		case "esc", "q":
+			m.state = viewMainMenu
+		}
+	}
+
+	return m, nil
+}
+
+// activateMenuItem executes the selected main menu action.
+func (m Model) activateMenuItem() (tea.Model, tea.Cmd) {
+	switch m.menuCursor {
+	case 0: // WiFi Analysis
+		m.state = viewWiFi
+		m.wifiLoading = true
+		m.wifiError = ""
+		return m, runWiFiScan()
+	case 1: // LAN Host Discovery
+		m.state = viewHosts
+		m.hostLoading = true
+		m.hostError = ""
+		return m, runHostScan(m.hostCIDR, m.isRoot)
+	case 2: // Help
+		m.state = viewHelp
+	case 3: // Quit
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+// ─── Async commands ───────────────────────────────────────────────────────────
+
+// tickCmd returns a command that fires after 100 ms to drive the spinner.
+func tickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+// runWiFiScan returns a BubbleTea command that performs the WiFi scan
+// in the background and sends the result as a wifiScanDoneMsg.
+func runWiFiScan() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		networks, err := wifi.Scan(ctx, "")
+		if err != nil {
+			return wifiScanDoneMsg{err: err}
+		}
+
+		var reports []risk.NetworkReport
+		for _, n := range networks {
+			reports = append(reports, risk.AnalyseNetwork(n))
+		}
+		return wifiScanDoneMsg{reports: reports}
+	}
+}
+
+// runHostScan returns a BubbleTea command that performs LAN discovery
+// in the background and sends the result as a hostScanDoneMsg.
+func runHostScan(cidr string, isRoot bool) tea.Cmd {
+	return func() tea.Msg {
+		if err := scanner.ValidateCIDR(cidr); err != nil {
+			return hostScanDoneMsg{err: err}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		hosts, err := scanner.DiscoverHosts(ctx, cidr, isRoot)
+		if err != nil {
+			return hostScanDoneMsg{err: err}
+		}
+
+		var reports []risk.HostReport
+		for _, h := range hosts {
+			reports = append(reports, risk.AnalyseHost(h))
+		}
+		return hostScanDoneMsg{reports: reports}
+	}
+}
+
+// runPortScan returns a BubbleTea command that scans open ports on a host.
+func runPortScan(ip string, isRoot bool) tea.Cmd {
+	return func() tea.Msg {
+		if err := scanner.ValidateIP(ip); err != nil {
+			return portScanDoneMsg{ip: ip, err: err}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		ports, err := scanner.PortScan(ctx, ip, "1-1024", isRoot)
+		if err != nil {
+			return portScanDoneMsg{ip: ip, err: err}
+		}
+		return portScanDoneMsg{ip: ip, ports: ports}
+	}
+}
+
+// ─── View ─────────────────────────────────────────────────────────────────────
+
+// View renders the current UI state as a string.
+func (m Model) View() string {
+	switch m.state {
+	case viewConsent:
+		return m.viewConsent()
+	case viewMainMenu:
+		return m.viewMainMenu()
+	case viewWiFi:
+		return m.viewWiFi()
+	case viewHosts:
+		return m.viewHosts()
+	case viewHostDetail:
+		return m.viewHostDetail()
+	case viewHelp:
+		return m.viewHelp()
+	default:
+		return "Unknown state"
+	}
+}
+
+// ─── Consent screen ───────────────────────────────────────────────────────────
+
+func (m Model) viewConsent() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	h := m.height
+	if h <= 0 {
+		h = 30
+	}
+
+	// ASCII logo with gradient-like colouring across lines.
+	logoLines := strings.Split(strings.TrimPrefix(novaASCII, "\n"), "\n")
+	logoColors := []lipgloss.Color{
+		"#BD93F9", "#A97EF5", "#9569F1", "#7B68EE", "#6754EB", "#5340E7",
+	}
+	var coloredLogo []string
+	for i, l := range logoLines {
+		cIdx := i
+		if cIdx >= len(logoColors) {
+			cIdx = len(logoColors) - 1
+		}
+		coloredLogo = append(coloredLogo,
+			lipgloss.NewStyle().Foreground(logoColors[cIdx]).Bold(true).Render(l))
+	}
+	logo := strings.Join(coloredLogo, "\n")
+
+	tagline := center(
+		lipgloss.NewStyle().Foreground(colorAccent).Italic(true).
+			Render("Network Observation & Vulnerability Analyzer"),
+		w,
+	)
+
+	consentBody := strings.TrimSpace(`
+⚠  LEGAL NOTICE
+
+By continuing you confirm that:
+
+  •  You OWN the network(s) you are about to scan, OR
+  •  You have received EXPLICIT written permission from the owner.
+
+Unauthorised scanning is ILLEGAL in most jurisdictions and may
+result in criminal or civil liability.
+
+This tool is for DEFENSIVE security assessment ONLY.
+It must NEVER be used for exploitation or unauthorised reconnaissance.`)
+
+	boxContent := styleBox.
+		Width(min(w-8, 72)).
+		BorderForeground(colorWarn).
+		Render(consentBody)
+
+	prompt := center(
+		lipgloss.NewStyle().Foreground(colorAccent2).Bold(true).
+			Render("Do you understand and accept these terms?"),
+		w,
+	)
+	hint := center(
+		styleHelp.Render("[y] Accept & continue    [n / q] Exit"),
+		w,
+	)
+
+	body := lipgloss.JoinVertical(lipgloss.Center,
+		center(logo, w),
+		tagline,
+		"",
+		center(boxContent, w),
+		"",
+		prompt,
+		hint,
+	)
+
+	// Vertically centre: count lines in body.
+	bodyLines := strings.Count(body, "\n") + 1
+	return vcenter(body, h, bodyLines)
+}
+
+// ─── Main menu ────────────────────────────────────────────────────────────────
+
+// menuIcons maps each menu item index to a decorative icon.
+var menuIcons = []string{"  ", "  ", "  ", "  "}
+
+func (m Model) viewMainMenu() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	h := m.height
+	if h <= 0 {
+		h = 30
+	}
+
+	// Logo (compact single-line colour version for the menu header).
+	logoLines := strings.Split(strings.TrimPrefix(novaASCII, "\n"), "\n")
+	logoColors := []lipgloss.Color{
+		"#BD93F9", "#A97EF5", "#9569F1", "#7B68EE", "#6754EB", "#5340E7",
+	}
+	var coloredLogo []string
+	for i, l := range logoLines {
+		cIdx := i
+		if cIdx >= len(logoColors) {
+			cIdx = len(logoColors) - 1
+		}
+		coloredLogo = append(coloredLogo,
+			lipgloss.NewStyle().Foreground(logoColors[cIdx]).Bold(true).Render(l))
+	}
+	logo := center(strings.Join(coloredLogo, "\n"), w)
+
+	tagline := center(
+		lipgloss.NewStyle().Foreground(colorAccent).Italic(true).
+			Render("Network Observation & Vulnerability Analyzer"),
+		w,
+	)
+
+	// Version badge.
+	badge := center(
+		lipgloss.NewStyle().
+			Foreground(colorFaint).
+			Render("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"),
+		w,
+	)
+
+	// Menu items rendered as pill cards.
+	menuWidth := 36
+	var menuCards []string
+	for i, item := range m.menuItems {
+		icon := ""
+		if i < len(menuIcons) {
+			icon = menuIcons[i]
+		}
+		if i == m.menuCursor {
+			inner := styleSelected.Render(" ▶ " + icon + item)
+			card := styleMenuBoxSelected.
+				Width(menuWidth).
+				Render(inner)
+			menuCards = append(menuCards, center(card, w))
+		} else {
+			inner := styleMuted.Render("   " + icon + item)
+			card := styleMenuBox.
+				Width(menuWidth).
+				Render(inner)
+			menuCards = append(menuCards, center(card, w))
+		}
+	}
+
+	// Privilege notice.
+	privNote := ""
+	if m.isRoot {
+		privNote = center(styleSuccess.Render("✔  Running as root — full scan capabilities enabled"), w)
+	} else {
+		privNote = center(styleWarn.Render("⚠  Running without root — some scan features limited"), w)
+	}
+
+	// Subnet info.
+	subnetLine := center(
+		styleMuted.Render("Subnet: ")+styleAccent.Render(m.hostCIDR),
+		w,
+	)
+
+	hintLine := center(
+		styleHelp.Render("↑ / k  ↓ / j   navigate    enter  select    q  quit"),
+		w,
+	)
+
+	parts := []string{
+		logo,
+		tagline,
+		badge,
+		"",
+	}
+	parts = append(parts, menuCards...)
+	parts = append(parts,
+		"",
+		privNote,
+		subnetLine,
+		"",
+		hintLine,
+	)
+
+	body := strings.Join(parts, "\n")
+	bodyLines := strings.Count(body, "\n") + 1
+	return vcenter(body, h, bodyLines)
+}
+
+// ─── WiFi view ────────────────────────────────────────────────────────────────
+
+func (m Model) viewWiFi() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+
+	headerTitle := styleTitle.Render("  WiFi Analysis ")
+	header := center(headerTitle, w)
+
+	var sb strings.Builder
+	sb.WriteString(header + "\n\n")
+
+	if m.wifiLoading {
+		sb.WriteString(center(
+			lipgloss.NewStyle().Foreground(colorAccent).Render(
+				spinnerFrames[m.spinner]+"  Scanning for WiFi networks…",
+			), w))
+		sb.WriteString("\n\n" + center(styleHelp.Render("esc · back"), w))
+		return sb.String()
+	}
+
+	if m.wifiError != "" {
+		sb.WriteString(center(styleDanger.Render("✖  "+m.wifiError), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("r · retry    esc · back"), w))
+		return sb.String()
+	}
+
+	if len(m.wifiReports) == 0 {
+		sb.WriteString(center(styleMuted.Render("No networks found — are you in range of a WiFi AP?"), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("r · rescan    esc · back"), w))
+		return sb.String()
+	}
+
+	// Column widths.
+	const (
+		wSSID  = 30
+		wSec   = 10
+		wSig   = 7
+		wChan  = 6
+		wFreq  = 10
+		wScore = 9
+	)
+
+	headerRow := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s",
+		wSSID, "SSID",
+		wSec, "Security",
+		wSig, "Signal",
+		wChan, "Chan",
+		wFreq, "Frequency",
+		"Score",
+	)
+	divider := strings.Repeat("─", min(w-2, 92))
+	sb.WriteString(styleMuted.Render(headerRow) + "\n")
+	sb.WriteString(styleFaint.Render(divider) + "\n")
+
+	maxVisible := m.height - 10
+	if maxVisible < 1 {
+		maxVisible = 10
+	}
+	start := 0
+	if m.wifiCursor >= maxVisible {
+		start = m.wifiCursor - maxVisible + 1
+	}
+
+	for i := start; i < len(m.wifiReports) && i < start+maxVisible; i++ {
+		r := m.wifiReports[i]
+		scoreColor := lipgloss.Color(risk.ScoreColor(r.Score))
+		scoreStyle := lipgloss.NewStyle().Foreground(scoreColor).Bold(true)
+
+		ssid := r.Network.SSID
+		if ssid == "" {
+			ssid = "‹hidden›"
+		}
+
+		rowText := fmt.Sprintf("%-*s  %-*s  %*d   %*d  %-*s  %s",
+			wSSID, truncateRunes(ssid, wSSID),
+			wSec, truncateRunes(r.Network.Security, wSec),
+			wSig-1, r.Network.Signal,
+			wChan-1, r.Network.Channel,
+			wFreq, r.Network.Frequency,
+			scoreStyle.Render(fmt.Sprintf("%3d/100", r.Score)),
+		)
+
+		if i == m.wifiCursor {
+			sb.WriteString(styleSelected.Render("▶ "+rowText) + "\n")
+			// Inline findings for selected row.
+			for _, f := range r.Findings {
+				fStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Color(risk.LevelColor(f.Level)))
+				sb.WriteString("   " + fStyle.Render("▸ "+f.Level.String()+": "+f.Title) + "\n")
+				wrapped := wordWrap("     "+f.Description, min(w-6, 90))
+				sb.WriteString(styleMuted.Render(wrapped) + "\n")
+			}
+		} else {
+			sb.WriteString("  " + rowText + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(center(
+		styleHelp.Render("↑ / k  ↓ / j   navigate    r  rescan    esc · back"),
+		w,
+	))
+	return sb.String()
+}
+
+// ─── Host list view ───────────────────────────────────────────────────────────
+
+func (m Model) viewHosts() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+
+	header := center(styleTitle.Render("  LAN Host Discovery "), w)
+	subLine := center(
+		styleMuted.Render("Subnet  ")+styleAccent.Render(m.hostCIDR),
+		w,
+	)
+
+	var sb strings.Builder
+	sb.WriteString(header + "\n")
+	sb.WriteString(subLine + "\n\n")
+
+	if m.hostLoading {
+		sb.WriteString(center(
+			lipgloss.NewStyle().Foreground(colorAccent).Render(
+				spinnerFrames[m.spinner]+"  Discovering hosts on "+m.hostCIDR+"…",
+			), w))
+		sb.WriteString("\n\n" + center(styleHelp.Render("esc · back"), w))
+		return sb.String()
+	}
+
+	if m.hostError != "" {
+		sb.WriteString(center(styleDanger.Render("✖  "+m.hostError), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("r · retry    esc · back"), w))
+		return sb.String()
+	}
+
+	if len(m.hostReports) == 0 {
+		sb.WriteString(center(styleMuted.Render("No hosts found. Try a broader CIDR or check connectivity."), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("r · rescan    esc · back"), w))
+		return sb.String()
+	}
+
+	// Table.
+	const (
+		wIP       = 16
+		wVendor   = 22
+		wHostname = 22
+		wScore    = 9
+	)
+	headerRow := fmt.Sprintf("  %-*s  %-*s  %-*s  %s",
+		wIP, "IP Address",
+		wVendor, "Vendor",
+		wHostname, "Hostname",
+		"Score",
+	)
+	divider := strings.Repeat("─", min(w-2, 82))
+	sb.WriteString(styleMuted.Render(headerRow) + "\n")
+	sb.WriteString(styleFaint.Render(divider) + "\n")
+
+	maxVisible := m.height - 10
+	if maxVisible < 1 {
+		maxVisible = 10
+	}
+	start := 0
+	if m.hostCursor >= maxVisible {
+		start = m.hostCursor - maxVisible + 1
+	}
+
+	for i := start; i < len(m.hostReports) && i < start+maxVisible; i++ {
+		r := m.hostReports[i]
+		scoreStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(risk.ScoreColor(r.Score))).Bold(true)
+
+		vendor := r.Host.Vendor
+		if vendor == "" {
+			vendor = "—"
+		}
+		hostname := r.Host.Hostname
+		if hostname == "" {
+			hostname = "—"
+		}
+
+		row := fmt.Sprintf("%-*s  %-*s  %-*s  %s",
+			wIP, r.Host.IP,
+			wVendor, truncateRunes(vendor, wVendor),
+			wHostname, truncateRunes(hostname, wHostname),
+			scoreStyle.Render(fmt.Sprintf("%3d/100", r.Score)),
+		)
+
+		if i == m.hostCursor {
+			sb.WriteString(styleSelected.Render("▶ "+row) + "\n")
+		} else {
+			sb.WriteString("  " + row + "\n")
+		}
+	}
+
+	// Scroll hint.
+	if len(m.hostReports) > maxVisible {
+		sb.WriteString(styleFaint.Render(
+			fmt.Sprintf("  … %d more", len(m.hostReports)-maxVisible-start)) + "\n")
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(center(
+		styleHelp.Render("↑ / k  ↓ / j   navigate    enter  port scan    r  rescan    esc · back"),
+		w,
+	))
+	return sb.String()
+}
+
+// ─── Host detail view ─────────────────────────────────────────────────────────
+
+func (m Model) viewHostDetail() string {
+	if m.selectedHost == nil {
+		return "No host selected."
+	}
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+
+	h := m.selectedHost
+	var sb strings.Builder
+
+	header := center(styleTitle.Render(fmt.Sprintf("  Host  %s ", h.Host.IP)), w)
+	sb.WriteString(header + "\n\n")
+
+	// Info panel.
+	var infoLines []string
+	if h.Host.Hostname != "" {
+		infoLines = append(infoLines,
+			styleMuted.Render("Hostname  ")+styleNormal.Render(h.Host.Hostname))
+	}
+	if h.Host.MAC != "" {
+		vendor := h.Host.Vendor
+		if vendor == "" {
+			vendor = "Unknown vendor"
+		}
+		infoLines = append(infoLines,
+			styleMuted.Render("MAC       ")+styleNormal.Render(h.Host.MAC+"  ("+vendor+")"))
+	}
+	if h.Host.OS != "" {
+		infoLines = append(infoLines,
+			styleMuted.Render("OS        ")+styleNormal.Render(h.Host.OS))
+	}
+	scoreColor := lipgloss.Color(risk.ScoreColor(h.Score))
+	scoreStyle := lipgloss.NewStyle().Foreground(scoreColor).Bold(true)
+	infoLines = append(infoLines,
+		styleMuted.Render("Score     ")+
+			scoreStyle.Render(fmt.Sprintf("%d/100  %s", h.Score, risk.ScoreLabel(h.Score))),
+	)
+
+	if len(infoLines) > 0 {
+		infoBox := styleBox.
+			BorderForeground(colorPrimary).
+			Width(min(w-8, 66)).
+			Render(strings.Join(infoLines, "\n"))
+		sb.WriteString(center(infoBox, w) + "\n\n")
+	}
+
+	// Port scan section.
+	sb.WriteString(center(styleAccent.Render("── Open Ports ──"), w) + "\n\n")
+
+	if m.portLoading {
+		sb.WriteString(center(
+			lipgloss.NewStyle().Foreground(colorAccent).
+				Render(spinnerFrames[m.spinner]+"  Scanning ports 1–1024…"),
+			w) + "\n")
+	} else if m.portError != "" {
+		sb.WriteString(center(styleDanger.Render("✖  Port scan error: "+m.portError), w) + "\n")
+	} else if len(h.Host.OpenPorts) == 0 {
+		sb.WriteString(center(styleMuted.Render("No open ports found in range 1–1024"), w) + "\n")
+	} else {
+		headerRow := fmt.Sprintf("  %-8s  %-6s  %s", "Port", "Proto", "Service")
+		divider := strings.Repeat("─", 40)
+		sb.WriteString(center(styleMuted.Render(headerRow), w) + "\n")
+		sb.WriteString(center(styleFaint.Render(divider), w) + "\n")
+		for _, p := range h.Host.OpenPorts {
+			label, danger := isDangerousPort(p.Number)
+			svc := p.Service
+			if svc == "" {
+				svc = "—"
+			}
+			row := fmt.Sprintf("  %-8d  %-6s  %s", p.Number, p.Protocol, svc)
+			if danger {
+				row += "  " + styleDanger.Render("⚠ "+label)
+				sb.WriteString(center(styleDanger.Render(row), w) + "\n")
+			} else {
+				sb.WriteString(center(styleNormal.Render(row), w) + "\n")
+			}
+		}
+	}
+
+	// Risk findings.
+	if len(h.Findings) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(center(styleAccent2.Render("── Risk Findings ──"), w) + "\n\n")
+		for _, f := range h.Findings {
+			fColor := lipgloss.Color(risk.LevelColor(f.Level))
+			fStyle := lipgloss.NewStyle().Foreground(fColor).Bold(true)
+			titleLine := fStyle.Render("▸ [" + f.Level.String() + "] " + f.Title)
+			descLine := styleMuted.Render("  " + f.Description)
+			sb.WriteString(center(titleLine, w) + "\n")
+			sb.WriteString(center(descLine, w) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(center(styleHelp.Render("esc · back to host list"), w))
+	return sb.String()
+}
+
+// ─── Help view ────────────────────────────────────────────────────────────────
+
+func (m Model) viewHelp() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	h := m.height
+	if h <= 0 {
+		h = 30
+	}
+
+	header := center(styleTitle.Render("  Key Bindings "), w)
+
+	bindings := [][2]string{
+		{"↑  /  k", "Move selection up"},
+		{"↓  /  j", "Move selection down"},
+		{"enter  /  space", "Select / activate"},
+		{"r", "Re-run current scan"},
+		{"esc  /  q", "Back / exit current view"},
+		{"ctrl + c", "Quit NOVA immediately"},
+	}
+
+	var rows []string
+	for _, b := range bindings {
+		keyPart := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).
+			Render(fmt.Sprintf("  %-22s", b[0]))
+		descPart := styleNormal.Render(b[1])
+		rows = append(rows, keyPart+styleFaint.Render(" │  ")+descPart)
+	}
+
+	table := styleBox.
+		BorderForeground(colorPrimary).
+		Width(min(w-8, 60)).
+		Render(strings.Join(rows, "\n"))
+
+	body := lipgloss.JoinVertical(lipgloss.Center,
+		header,
+		"",
+		center(table, w),
+		"",
+		center(styleHelp.Render("esc · back to main menu"), w),
+	)
+
+	bodyLines := strings.Count(body, "\n") + 1
+	return vcenter(body, h, bodyLines)
+}
+
+// ─── Run ──────────────────────────────────────────────────────────────────────
+
+// Run starts the BubbleTea program. It blocks until the user quits.
+func Run(isRoot bool, hostCIDR string) error {
+	m := NewModel(isRoot, hostCIDR)
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	_, err := p.Run()
+	return err
+}
+
+// CheckPrivilege returns true if the process is running as root (UID 0).
+func CheckPrivilege() bool {
+	return os.Getuid() == 0
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func truncate32(s string) string {
+	return truncateRunes(s, 32)
+}
+
+func truncate20(s string) string {
+	return truncateRunes(s, 20)
+}
+
+func truncate18(s string) string {
+	return truncateRunes(s, 18)
+}
+
+func truncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s + strings.Repeat(" ", max-len(runes))
+	}
+	return string(runes[:max-1]) + "…"
+}
+
+// wordWrap wraps s at w characters per line while preserving leading indent.
+func wordWrap(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return s
+	}
+	// Extract leading whitespace from original string.
+	indent := ""
+	for _, r := range s {
+		if r == ' ' || r == '\t' {
+			indent += string(r)
+		} else {
+			break
+		}
+	}
+
+	var lines []string
+	current := indent
+	for _, word := range words {
+		if current == indent {
+			current += word
+		} else if len(current)+1+len(word) > w {
+			lines = append(lines, current)
+			current = indent + word
+		} else {
+			current += " " + word
+		}
+	}
+	if current != indent {
+		lines = append(lines, current)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// isDangerousPort returns a label and true if the port is in the danger list.
+func isDangerousPort(port int) (string, bool) {
+	dangerPorts := map[int]string{
+		21: "FTP", 23: "Telnet", 445: "SMB", 3389: "RDP",
+		1900: "UPnP", 4444: "Backdoor?", 6379: "Redis", 27017: "MongoDB",
+	}
+	label, ok := dangerPorts[port]
+	return label, ok
+}

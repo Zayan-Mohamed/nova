@@ -1,0 +1,49 @@
+# golangci-lint configuration for NOVA
+# Docs: https://golangci-lint.run/usage/configuration/
+version: "2"
+
+linters:
+  enable:
+    - errcheck # check all errors are handled
+    - gosimple # suggest simplifications
+    - govet # go vet checks
+    - ineffassign # detect ineffectual assignments
+    - staticcheck # static analysis
+    - unused # unused code
+    - gosec # security issues
+    - gochecknoglobals # flag global vars (except whitelisted)
+    - godot # doc comments end with period
+    - misspell # typos in comments and strings
+    - prealloc # slice preallocation suggestions
+    - revive # general Go linting rules
+    - unconvert # unnecessary type conversions
+    - unparam # unused function parameters
+    - whitespace # trailing whitespace
+
+  settings:
+    gosec:
+      excludes:
+        # G204: subprocess launched with variable — we deliberately use
+        # structured exec.Command calls; shell injection is already mitigated
+        # by our input validation layer. This exclusion is intentional.
+        - G204
+    gochecknoglobals:
+      check-values: false # allow var declarations at package level (e.g. styles)
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+            - disableStutteringCheck
+
+issues:
+  exclusions:
+    rules:
+      # Allow fmt.Println in main/cmd — it is intentional CLI output.
+      - path: "cmd/"
+        linters: [forbidigo]
+      # Test files are exempt from some rules.
+      - path: "_test\\.go"
+        linters: [gosec, gochecknoglobals]
+  max-issues-per-linter: 0
+  max-same-issues: 0

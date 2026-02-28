@@ -1,0 +1,8 @@
+nova
+.env
+.env.*
+*.log
+*.cache
+
+build/
+dist/

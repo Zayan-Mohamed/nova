@@ -1,0 +1,94 @@
+name: Bug Report
+description: Report a reproducible bug in NOVA
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug!
+        Please fill in as much detail as possible so we can reproduce and fix it quickly.
+
+  - type: input
+    id: nova-version
+    attributes:
+      label: NOVA version
+      description: Run `nova --version` or check the release tag.
+      placeholder: "e.g. v0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (Ubuntu / Debian)
+        - Linux (Fedora / RHEL)
+        - Linux (Arch)
+        - Linux (other)
+        - macOS (Intel)
+        - macOS (Apple Silicon)
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "e.g. Ubuntu 24.04, macOS 15.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: privileges
+    attributes:
+      label: Running as root?
+      options:
+        - "Yes (sudo nova)"
+        - "No (nova)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Launch `nova -s 192.168.1.0/24`
+        2. Accept the consent screen
+        3. Select "LAN Host Discovery"
+        4. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or error messages
+      render: shell
+
+  - type: checkboxes
+    id: security-check
+    attributes:
+      label: Security check
+      description: If this is a security vulnerability, do NOT use this form.
+      options:
+        - label: This is NOT a security vulnerability. I have read [SECURITY.md](../SECURITY.md).
+          required: true

@@ -1,0 +1,97 @@
+# .goreleaser.yaml — GoReleaser v2 configuration for NOVA
+# Docs: https://goreleaser.com/customization/
+version: 2
+
+project_name: nova
+
+before:
+  hooks:
+    - go mod tidy
+    - go vet ./...
+
+builds:
+  - id: nova
+    main: .
+    binary: nova
+    # Inject version, commit, and build date at link time.
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0 # fully static binary; no libc dependency
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Ignore combinations that don't exist.
+    ignore:
+      - goos: windows
+
+archives:
+  - id: nova-archive
+    builds: [nova]
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+    files:
+      - README.md
+      - LICENSE
+      - SECURITY.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
+  groups:
+    - title: "New Features"
+      regexp: "^feat"
+      order: 0
+    - title: "Bug Fixes"
+      regexp: "^fix"
+      order: 1
+    - title: "Security"
+      regexp: "^(security|vuln)"
+      order: 2
+    - title: "Performance"
+      regexp: "^perf"
+      order: 3
+    - title: "Refactoring"
+      regexp: "^refactor"
+      order: 4
+    - title: "CI / Build"
+      regexp: "^ci"
+      order: 5
+    - title: Other
+      order: 999
+
+release:
+  github:
+    owner: Zayan-Mohamed
+    name: nova
+  name_template: "NOVA {{.Tag}}"
+  header: |
+    ## NOVA {{.Tag}} — {{.Date}}
+
+    > ⚠ Only scan networks you own or have explicit permission to assess.
+
+  footer: |
+    ---
+    **Full changelog:** https://github.com/Zayan-Mohamed/nova/compare/{{.PreviousTag}}...{{.Tag}}
+
+    **Checksums:** See `checksums.txt` attached to this release.
+
+  # Mark pre-release if the tag contains a pre-release suffix (e.g. v1.0.0-beta.1)
+  prerelease: auto

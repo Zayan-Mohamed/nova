@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest a new defensive analysis feature for NOVA
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature!
+        Please remember that NOVA is a **defensive** tool only.
+        Requests for offensive capabilities (exploitation, brute-forcing, injection, etc.)
+        will be closed immediately.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Feature summary
+      description: A clear and concise description of what you want NOVA to do.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / use-case
+      description: What security problem does this help a network owner understand or fix?
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Suggested implementation (optional)
+      description: Any thoughts on how this could be implemented safely.
+
+  - type: checkboxes
+    id: defensive-check
+    attributes:
+      label: Defensive scope confirmation
+      options:
+        - label: This feature is purely defensive — it helps network owners understand their own security posture.
+          required: true
+        - label: This feature does NOT involve exploitation, brute-forcing, evasion, or any offensive capability.
+          required: true
+        - label: I have read [CONTRIBUTING.md](../CONTRIBUTING.md).
+          required: true
