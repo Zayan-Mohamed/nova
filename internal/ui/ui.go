@@ -75,10 +75,13 @@ type Model struct {
 	menuItems  []string
 
 	// wifi
-	wifiReports []risk.NetworkReport
-	wifiCursor  int
-	wifiLoading bool
-	wifiError   string
+	wifiReports      []risk.NetworkReport
+	wifiCursor       int
+	wifiLoading      bool
+	wifiError        string
+	wifiSearchActive bool   // true when search input is focused
+	wifiSearchQuery  string // current search text
+	wifiFilterSec    string // "" = all, "open", "wpa2", "wpa3"
 
 	// hosts
 	hostReports []risk.HostReport
@@ -352,22 +355,74 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// ── WiFi view ──
 	case viewWiFi:
-		switch key {
-		case "up", "k":
-			if m.wifiCursor > 0 {
-				m.wifiCursor--
+		if m.wifiSearchActive {
+			// Search input mode.
+			switch key {
+			case "esc":
+				m.wifiSearchActive = false
+				m.wifiSearchQuery = ""
+				m.wifiCursor = 0
+			case "enter":
+				m.wifiSearchActive = false
+				m.wifiCursor = 0
+			case "backspace", "delete":
+				if len(m.wifiSearchQuery) > 0 {
+					m.wifiSearchQuery = m.wifiSearchQuery[:len(m.wifiSearchQuery)-1]
+					m.wifiCursor = 0
+				}
+			case "ctrl+u":
+				// Clear entire search.
+				m.wifiSearchQuery = ""
+				m.wifiCursor = 0
+			default:
+				// Single printable character.
+				if len(key) == 1 && key[0] >= 32 && key[0] <= 126 {
+					m.wifiSearchQuery += key
+					m.wifiCursor = 0
+				}
 			}
-		case "down", "j":
-			if m.wifiCursor < len(m.wifiReports)-1 {
-				m.wifiCursor++
+		} else {
+			// Normal navigation mode.
+			filtered := m.filterWiFiReports()
+			switch key {
+			case "up", "k":
+				if m.wifiCursor > 0 {
+					m.wifiCursor--
+				}
+			case "down", "j":
+				if m.wifiCursor < len(filtered)-1 {
+					m.wifiCursor++
+				}
+			case "/":
+				// Enter search mode.
+				m.wifiSearchActive = true
+				m.wifiSearchQuery = ""
+			case "f":
+				// Cycle through security filters: "" → "open" → "wpa2" → "wpa3" → "".
+				switch m.wifiFilterSec {
+				case "":
+					m.wifiFilterSec = "open"
+				case "open":
+					m.wifiFilterSec = "wpa2"
+				case "wpa2":
+					m.wifiFilterSec = "wpa3"
+				case "wpa3":
+					m.wifiFilterSec = ""
+				}
+				m.wifiCursor = 0
+			case "c":
+				// Clear all filters.
+				m.wifiSearchQuery = ""
+				m.wifiFilterSec = ""
+				m.wifiCursor = 0
+			case "r":
+				// Re-scan.
+				m.wifiLoading = true
+				m.wifiError = ""
+				return m, runWiFiScan()
+			case "esc", "q":
+				m.state = viewMainMenu
 			}
-		case "r":
-			// Re-scan.
-			m.wifiLoading = true
-			m.wifiError = ""
-			return m, runWiFiScan()
-		case "esc", "q":
-			m.state = viewMainMenu
 		}
 
 	// ── Host list view ──
@@ -720,6 +775,50 @@ func (m Model) viewMainMenu() string {
 
 // ─── WiFi view ────────────────────────────────────────────────────────────────
 
+// filterWiFiReports returns the WiFi reports that match current filters.
+func (m Model) filterWiFiReports() []risk.NetworkReport {
+	if m.wifiSearchQuery == "" && m.wifiFilterSec == "" {
+		return m.wifiReports
+	}
+
+	var filtered []risk.NetworkReport
+	query := strings.ToLower(m.wifiSearchQuery)
+
+	for _, r := range m.wifiReports {
+		// Security filter.
+		if m.wifiFilterSec != "" {
+			sec := strings.ToLower(r.Network.Security)
+			switch m.wifiFilterSec {
+			case "open":
+				if !strings.Contains(sec, "open") && sec != "" && sec != "none" {
+					continue
+				}
+			case "wpa2":
+				if !strings.Contains(sec, "wpa2") {
+					continue
+				}
+			case "wpa3":
+				if !strings.Contains(sec, "wpa3") {
+					continue
+				}
+			}
+		}
+
+		// Search query (matches SSID or BSSID).
+		if query != "" {
+			ssid := strings.ToLower(r.Network.SSID)
+			bssid := strings.ToLower(r.Network.BSSID)
+			if !strings.Contains(ssid, query) && !strings.Contains(bssid, query) {
+				continue
+			}
+		}
+
+		filtered = append(filtered, r)
+	}
+
+	return filtered
+}
+
 func (m Model) viewWiFi() string {
 	w := m.width
 	if w <= 0 {
@@ -730,7 +829,30 @@ func (m Model) viewWiFi() string {
 	header := center(headerTitle, w)
 
 	var sb strings.Builder
-	sb.WriteString(header + "\n\n")
+	sb.WriteString(header + "\n")
+
+	// Search/filter bar.
+	if m.wifiSearchActive {
+		// Search input mode.
+		searchPrompt := styleAccent.Render("Search: ") + styleNormal.Render(m.wifiSearchQuery) + styleSelected.Render("█")
+		sb.WriteString(center(searchPrompt, w) + "\n")
+		sb.WriteString(center(styleFaint.Render("enter · apply    esc · cancel    ctrl+u · clear"), w) + "\n\n")
+	} else {
+		// Filter status line.
+		var filterBadges []string
+		if m.wifiSearchQuery != "" {
+			filterBadges = append(filterBadges,
+				styleAccent.Render("⌕")+styleMuted.Render(m.wifiSearchQuery))
+		}
+		if m.wifiFilterSec != "" {
+			filterBadges = append(filterBadges,
+				styleAccent2.Render("🛡 ")+styleMuted.Render(strings.ToUpper(m.wifiFilterSec)))
+		}
+		if len(filterBadges) > 0 {
+			sb.WriteString(center(strings.Join(filterBadges, "  "), w) + "\n")
+		}
+		sb.WriteString("\n")
+	}
 
 	if m.wifiLoading {
 		sb.WriteString(center(
@@ -747,10 +869,25 @@ func (m Model) viewWiFi() string {
 		return sb.String()
 	}
 
+	filtered := m.filterWiFiReports()
+
 	if len(m.wifiReports) == 0 {
 		sb.WriteString(center(styleMuted.Render("No networks found — are you in range of a WiFi AP?"), w) + "\n")
 		sb.WriteString("\n" + center(styleHelp.Render("r · rescan    esc · back"), w))
 		return sb.String()
+	}
+
+	if len(filtered) == 0 {
+		sb.WriteString(center(styleMuted.Render("No networks match current filters."), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("c · clear filters    r · rescan    esc · back"), w))
+		return sb.String()
+	}
+
+	// Show count if filtered.
+	if len(filtered) < len(m.wifiReports) {
+		sb.WriteString(center(
+			styleFaint.Render(fmt.Sprintf("Showing %d of %d networks", len(filtered), len(m.wifiReports))),
+			w) + "\n")
 	}
 
 	// Column widths.
@@ -784,8 +921,8 @@ func (m Model) viewWiFi() string {
 		start = m.wifiCursor - maxVisible + 1
 	}
 
-	for i := start; i < len(m.wifiReports) && i < start+maxVisible; i++ {
-		r := m.wifiReports[i]
+	for i := start; i < len(filtered) && i < start+maxVisible; i++ {
+		r := filtered[i]
 		scoreColor := lipgloss.Color(risk.ScoreColor(r.Score))
 		scoreStyle := lipgloss.NewStyle().Foreground(scoreColor).Bold(true)
 
@@ -819,10 +956,17 @@ func (m Model) viewWiFi() string {
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(center(
-		styleHelp.Render("↑ / k  ↓ / j   navigate    r  rescan    esc · back"),
-		w,
-	))
+	if m.wifiSearchActive {
+		sb.WriteString(center(
+			styleHelp.Render("Type to search    enter · apply    esc · cancel"),
+			w,
+		))
+	} else {
+		sb.WriteString(center(
+			styleHelp.Render("↑/k ↓/j  navigate    /  search    f  filter security    c  clear    r  rescan    esc · back"),
+			w,
+		))
+	}
 	return sb.String()
 }
 

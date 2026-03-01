@@ -1,14 +1,6 @@
 module github.com/Zayan-Mohamed/nova
 
-// go = minimum version required to BUILD this module.
-// Keeping this at 1.24.0 lets tooling built with Go 1.24 (e.g. golangci-lint)
-// process the module without errors.
-go 1.24.0
-
-// toolchain = the Go release used during active development.
-// setup-go v5 reads this directive from go.mod and installs this toolchain
-// in CI automatically when go-version-file: go.mod is set.
-toolchain go1.25.5
+go 1.25.5
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
