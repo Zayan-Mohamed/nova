@@ -12,9 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sync"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 )
@@ -28,6 +28,10 @@ const maxHosts = 512
 
 // maxOpenPorts is the ceiling on ports per host.
 const maxOpenPorts = 1024
+
+// arpSettleDelay is how long we wait after sending ARP-warmup UDP packets for
+// the kernel to receive and process ARP replies from live hosts on the LAN.
+const arpSettleDelay = 1500 * time.Millisecond
 
 // Host represents a single discovered LAN host.
 type Host struct {
@@ -160,12 +164,11 @@ func sanitizeProtocol(s string) string {
 
 // DiscoverHosts discovers live hosts on the given CIDR subnet.
 //
-//   - With root: delegates to nmap with raw ICMP/ARP probes — returns MAC,
-//     vendor, OS fingerprint and is the most comprehensive method.
-//   - Without root: uses a parallel ping sweep via the system ping binary
-//     (which is setuid-root on Linux/macOS so it can send ICMP echo without
-//     the calling process being privileged). Responding hosts are enriched
-//     from the kernel ARP cache (MAC address) and reverse DNS (hostname).
+//   - With root: nmap raw ICMP/ARP probes (-PE -PP) — fastest, most accurate.
+//   - Without root: nmap TCP-connect ping (-PS) against common ports so hosts
+//     are found even when ICMP is completely blocked by the network firewall.
+//     Results are merged with the kernel ARP cache so hosts already known to
+//     the OS (router, recent peers) always appear even if all probes fail.
 func DiscoverHosts(ctx context.Context, cidr string, isRoot bool) ([]Host, error) {
 	if err := ValidateCIDR(cidr); err != nil {
 		return nil, err
@@ -176,15 +179,54 @@ func DiscoverHosts(ctx context.Context, cidr string, isRoot bool) ([]Host, error
 		defer cancel()
 	}
 	if isRoot {
-		return discoverWithNmap(ctx, cidr)
+		return discoverWithNmap(ctx, cidr, true)
 	}
-	return discoverWithPing(ctx, cidr)
+	return discoverWithNmap(ctx, cidr, false)
 }
 
-// discoverWithNmap runs nmap -sn with raw ICMP probes. Requires root.
-func discoverWithNmap(ctx context.Context, cidr string) ([]Host, error) {
-	// -PE: ICMP echo  -PP: ICMP timestamp  (ARP is automatic for LAN targets)
-	args := []string{"-sn", "-n", "-oX", "-", "-PE", "-PP", cidr}
+// discoverWithNmap runs an nmap ping scan and merges the results with the
+// kernel ARP cache.
+//
+//   - root=true:  -PE -PP (raw ICMP echo + timestamp probes; ARP automatic).
+//   - root=false: -PS<ports> (TCP SYN/connect ping to common service ports).
+//     nmap automatically falls back to TCP connect() when it cannot open raw
+//     sockets, so this works without any special privilege.
+//
+// The ARP-cache merge ensures that hosts the kernel already knows about
+// (router, DHCP server, recently-seen peers) are always included, even when
+// every probe type is blocked by the network.
+func discoverWithNmap(ctx context.Context, cidr string, isRoot bool) ([]Host, error) {
+	var args []string
+	if isRoot {
+		// Raw ICMP probes — ARP is added automatically by nmap for LAN targets.
+		args = []string{
+			"-sn", "-n", "-oX", "-",
+			"-PE", "-PP",
+			"--host-timeout", "5s",
+			"-T4",
+			cidr,
+		}
+	} else {
+		// Warm up the kernel ARP cache first. We send one UDP datagram to
+		// every IP in the subnet; the kernel must ARP-resolve each address
+		// before it can transmit, so every live host on the LAN will reply
+		// and its entry will appear in /proc/net/arp — regardless of whether
+		// it has any open TCP port or passes ICMP. No root privilege needed.
+		arpWarmup(ctx, cidr)
+		// TCP SYN/connect ping on a wide set of common service ports.
+		// nmap uses TCP connect() when raw sockets are unavailable, so this
+		// works fully without root.  -Pn is NOT set so nmap still skips hosts
+		// that don't respond to any probe (keeps the scan fast).
+		args = []string{
+			"-sn", "-n", "-oX", "-",
+			"-PS22,23,80,135,139,443,445,3389,8080,8443",
+			"-PA80,443",
+			"--host-timeout", "5s",
+			"-T4",
+			cidr,
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "nmap", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -193,161 +235,112 @@ func discoverWithNmap(ctx context.Context, cidr string) ([]Host, error) {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("host discovery timed out")
 		}
-		// Partial XML? Try to parse whatever nmap wrote before failing.
+		// Partial output? Try to parse what nmap wrote before crashing.
 		if stdout.Len() > 0 {
 			if hosts := parseNmapXMLHosts(stdout.String()); len(hosts) > 0 {
-				return hosts, nil
+				return mergeARPCache(hosts, cidr), nil
 			}
 		}
-		if stderr.Len() == 0 {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("nmap host discovery failed: %w", err)
+		// Nmap unavailable or hard error — fall back to ARP-only.
+		return discoverFromARP(cidr), nil
 	}
-	return parseNmapXMLHosts(stdout.String()), nil
+
+	nmapHosts := parseNmapXMLHosts(stdout.String())
+	return mergeARPCache(nmapHosts, cidr), nil
 }
 
-// discoverWithPing discovers hosts using a three-layer strategy so it works
-// even on networks where ICMP is blocked (corporate, university, etc.):
-//
-//  1. ARP cache — instant, requires no ICMP, works on any LAN segment.
-//     Populated by the kernel whenever the machine communicates with a host.
-//  2. ICMP ping — standard sweep for hosts not yet in ARP.
-//     Requires the system ping binary to have setuid/CAP_NET_RAW.
-//  3. TCP connect probe — for hosts that block ICMP but have open/closed TCP
-//     ports on common services (80, 22, 443, 53). "Connection refused" means
-//     the host is alive even if no port is open.
-func discoverWithPing(ctx context.Context, cidr string) ([]Host, error) {
-	ips, err := enumerateIPs(cidr)
-	if err != nil {
-		return nil, err
-	}
+// mergeARPCache enriches nmapHosts with MAC addresses from the ARP cache and
+// adds any ARP-known hosts that nmap missed (e.g. host blocked all probes but
+// the kernel still has a valid ARP entry from prior communication).
+func mergeARPCache(nmapHosts []Host, cidr string) []Host {
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, err
+		return nmapHosts
 	}
-
-	// ── Layer 1: ARP cache (zero-latency, ICMP-independent) ──────────────────
-	// arpTable: confirmed entries (non-zero MAC) → used for host identity + MAC.
-	// arpKnown: all entries including incomplete ones → seed for TCP probe.
 	arpTable := readARPCache()
-	arpKnown := readARPCacheKnownIPs(network)
-	upIPs := make(map[string]bool)
-	for ip := range arpTable {
-		if parsed := net.ParseIP(ip); parsed != nil && network.Contains(parsed) {
-			upIPs[ip] = true
-		}
-	}
 
-	// ── Layers 2 & 3: parallel ping + TCP probe for remaining IPs ────────────
-	const concurrency = 50
-	type pResult struct {
-		ip string
-		up bool
-	}
-	results := make(chan pResult, len(ips))
-	sem := make(chan struct{}, concurrency)
-
-	var wg sync.WaitGroup
-outerLoop:
-	for _, ip := range ips {
-		if upIPs[ip] {
-			continue // already confirmed via ARP
-		}
-		select {
-		case <-ctx.Done():
-			break outerLoop
-		case sem <- struct{}{}: // acquire concurrency slot
-		}
-		wg.Add(1)
-		go func(ip string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			// Hosts in incomplete ARP entries are known to the network; skip the
-			// slow ICMP sweep and go straight to the faster TCP probe.
-			var up bool
-			if arpKnown[ip] {
-				up = tcpProbe(ctx, ip)
-			} else {
-				up = icmpProbe(ctx, ip) || tcpProbe(ctx, ip)
+	// Index nmap results by IP for O(1) lookup.
+	byIP := make(map[string]*Host, len(nmapHosts))
+	result := make([]Host, len(nmapHosts))
+	copy(result, nmapHosts)
+	for i := range result {
+		// Fill in missing MAC from ARP.
+		if result[i].MAC == "" {
+			if mac, ok := arpTable[result[i].IP]; ok {
+				result[i].MAC = mac
 			}
-			results <- pResult{ip: ip, up: up}
-		}(ip)
-	}
-	go func() { wg.Wait(); close(results) }()
-
-	for r := range results {
-		if r.up {
-			upIPs[r.ip] = true
 		}
+		byIP[result[i].IP] = &result[i]
 	}
 
-	if len(upIPs) == 0 {
-		return nil, nil
-	}
-
-	// Enrich with hostname (reverse DNS). MAC already in arpTable.
-	hosts := make([]Host, 0, len(upIPs))
-	for ip := range upIPs {
-		h := Host{IP: ip}
-		if mac, ok := arpTable[ip]; ok {
-			h.MAC = mac
+	// Add ARP-known hosts nmap didn't find.
+	for ip, mac := range arpTable {
+		if byIP[ip] != nil {
+			continue
 		}
+		parsed := net.ParseIP(ip)
+		if parsed == nil || !network.Contains(parsed) {
+			continue
+		}
+		if len(result) >= maxHosts {
+			break
+		}
+		h := Host{IP: ip, MAC: mac}
+		if names, rErr := net.LookupAddr(ip); rErr == nil && len(names) > 0 {
+			h.Hostname = sanitizeField(strings.TrimSuffix(names[0], "."))
+		}
+		result = append(result, h)
+	}
+	return result
+}
+
+// discoverFromARP returns hosts visible in the kernel ARP cache for cidr.
+// Used as a last-resort fallback when nmap is unavailable.
+func discoverFromARP(cidr string) []Host {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil
+	}
+	arpTable := readARPCache()
+	var hosts []Host
+	for ip, mac := range arpTable {
+		if len(hosts) >= maxHosts {
+			break
+		}
+		parsed := net.ParseIP(ip)
+		if parsed == nil || !network.Contains(parsed) {
+			continue
+		}
+		h := Host{IP: ip, MAC: mac}
 		if names, rErr := net.LookupAddr(ip); rErr == nil && len(names) > 0 {
 			h.Hostname = sanitizeField(strings.TrimSuffix(names[0], "."))
 		}
 		hosts = append(hosts, h)
 	}
-	return hosts, nil
+	return hosts
 }
 
-// icmpProbe sends a single ICMP echo request and returns true if the host
-// responds within 1 second. Requires setuid/CAP_NET_RAW on the ping binary.
-func icmpProbe(ctx context.Context, ip string) bool {
-	pCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	// -W 1: wait at most 1 s for a reply (avoids default 10-s wait on some distros).
-	return exec.CommandContext(pCtx, "ping", "-c", "1", "-W", "1", ip).Run() == nil
-}
-
-// tcpProbe tries TCP connects on common ports. A refused connection proves
-// the remote TCP stack is alive even when ICMP is blocked by a firewall.
-func tcpProbe(ctx context.Context, ip string) bool {
-	for _, port := range []int{80, 22, 443, 53} {
-		addr := fmt.Sprintf("%s:%d", ip, port)
-		pCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-		conn, dialErr := (&net.Dialer{}).DialContext(pCtx, "tcp", addr)
-		cancel()
-		if conn != nil {
-			_ = conn.Close()
-			return true // port open = host alive
-		}
-		// "connection refused" = host alive, port merely closed.
-		if dialErr != nil && strings.Contains(dialErr.Error(), "connection refused") {
-			return true
-		}
-	}
-	return false
-}
-
-// enumerateIPs returns all usable host IPs within cidr, excluding the network
-// and broadcast addresses. The result is capped at maxHosts entries.
-func enumerateIPs(cidr string) ([]string, error) {
+// arpWarmup sends one UDP datagram to every host address in cidr, which
+// causes the Linux kernel to issue an ARP broadcast for each destination.
+// Every live device on the LAN must reply to ARP (it cannot be blocked by
+// iptables/nftables, which operate above L2), so after waiting arpSettleDelay
+// the kernel neighbour table will contain an entry for every reachable host.
+// This needs no root privilege and is immune to ICMP/TCP firewalls.
+func arpWarmup(ctx context.Context, cidr string) {
 	_, network, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, err
+		return
 	}
-	// Clone so we can safely increment.
+
+	// Enumerate all usable host addresses (skip network + broadcast), capped.
 	cur := make(net.IP, len(network.IP))
 	copy(cur, network.IP)
-
 	var ips []string
 	for network.Contains(cur) {
-		if len(ips) >= maxHosts {
+		if len(ips) >= maxHosts+2 {
 			break
 		}
 		ips = append(ips, cur.String())
-		// Increment the IP by 1 (big-endian).
 		for j := len(cur) - 1; j >= 0; j-- {
 			cur[j]++
 			if cur[j] != 0 {
@@ -355,11 +348,41 @@ func enumerateIPs(cidr string) ([]string, error) {
 			}
 		}
 	}
-	// Drop network address (first) and broadcast (last).
 	if len(ips) >= 2 {
 		ips = ips[1 : len(ips)-1]
 	}
-	return ips, nil
+
+	const fanout = 128
+	sem := make(chan struct{}, fanout)
+	var wg sync.WaitGroup
+	for _, ip := range ips {
+		select {
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(ipStr string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			addr := &net.UDPAddr{IP: net.ParseIP(ipStr), Port: 9}
+			conn, dialErr := net.DialUDP("udp", nil, addr)
+			if dialErr != nil {
+				return
+			}
+			_ = conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
+			_, _ = conn.Write([]byte{0})
+			_ = conn.Close()
+		}(ip)
+	}
+	wg.Wait()
+
+	// Give the kernel time to process ARP replies before we read the cache.
+	select {
+	case <-ctx.Done():
+	case <-time.After(arpSettleDelay):
+	}
 }
 
 // ─── ARP helpers ──────────────────────────────────────────────────────────────
@@ -370,30 +393,7 @@ func enumerateIPs(cidr string) ([]string, error) {
 // and falls back to running `arp -an` on macOS / BSD.
 func readARPCache() map[string]string {
 	table := make(map[string]string)
-	readARPCacheInto(table, true)
-	return table
-}
 
-// readARPCacheKnownIPs returns the set of all IP addresses that appear in the
-// kernel ARP table — including incomplete entries (flags 0x0) that have no
-// confirmed MAC yet. This lets us probe hosts the kernel knows about even when
-// ICMP is blocked and the ARP handshake has not yet completed.
-func readARPCacheKnownIPs(network *net.IPNet) map[string]bool {
-	known := make(map[string]bool)
-	raw := make(map[string]string) // ip → raw MAC (may be all-zero)
-	readARPCacheInto(raw, false)
-	for ip := range raw {
-		if parsed := net.ParseIP(ip); parsed != nil && network.Contains(parsed) {
-			known[ip] = true
-		}
-	}
-	return known
-}
-
-// readARPCacheInto populates dst.  If onlyComplete is true only entries with a
-// valid non-zero MAC are stored; otherwise all entries are stored (with the raw
-// MAC value, which may be "00:00:00:00:00:00" for incomplete entries).
-func readARPCacheInto(dst map[string]string, onlyComplete bool) {
 	// Linux: /proc/net/arp columns: IP, HW type, Flags, HW address, Mask, Device
 	if f, fErr := os.Open("/proc/net/arp"); fErr == nil {
 		defer func() { _ = f.Close() }()
@@ -405,50 +405,32 @@ func readARPCacheInto(dst map[string]string, onlyComplete bool) {
 				continue
 			}
 			ip := sanitizeIP(fields[0])
-			if ip == "" {
-				continue
-			}
-			mac := strings.ToUpper(strings.TrimSpace(fields[3]))
-			if onlyComplete {
-				mac = sanitizeMAC(mac)
-				if mac == "" || mac == "00:00:00:00:00:00" {
-					continue
-				}
-				dst[ip] = mac
-			} else {
-				// Keep all entries so we know the host's IP exists in the ARP table.
-				dst[ip] = mac
+			mac := sanitizeMAC(strings.ToUpper(fields[3]))
+			if ip != "" && mac != "" && mac != "00:00:00:00:00:00" {
+				table[ip] = mac
 			}
 		}
-		return
+		return table
 	}
 
 	// macOS / BSD fallback: arp -an
 	// Example line: ? (10.0.0.1) at a4:b1:e9:xx:xx:xx on en0 ifscope ...
 	out, aErr := exec.Command("arp", "-an").Output()
 	if aErr != nil {
-		return
+		return table
 	}
 	arpRe := regexp.MustCompile(`\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-fA-F:]{17})`)
 	for _, line := range strings.Split(string(out), "\n") {
 		m := arpRe.FindStringSubmatch(line)
 		if len(m) == 3 {
 			ip := sanitizeIP(m[1])
-			if ip == "" {
-				continue
-			}
-			mac := strings.ToUpper(m[2])
-			if onlyComplete {
-				mac = sanitizeMAC(mac)
-				if mac == "" || mac == "00:00:00:00:00:00" {
-					continue
-				}
-				dst[ip] = mac
-			} else {
-				dst[ip] = mac
+			mac := sanitizeMAC(strings.ToUpper(m[2]))
+			if ip != "" && mac != "" {
+				table[ip] = mac
 			}
 		}
 	}
+	return table
 }
 
 // ─── Port Scanning ───────────────────────────────────────────────────────────
