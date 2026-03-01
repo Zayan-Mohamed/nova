@@ -5,7 +5,6 @@ version: "2"
 linters:
   enable:
     - errcheck # check all errors are handled
-    - gosimple # suggest simplifications
     - govet # go vet checks
     - ineffassign # detect ineffectual assignments
     - staticcheck # static analysis
@@ -27,8 +26,6 @@ linters:
         # structured exec.Command calls; shell injection is already mitigated
         # by our input validation layer. This exclusion is intentional.
         - G204
-    gochecknoglobals:
-      check-values: false # allow var declarations at package level (e.g. styles)
     revive:
       rules:
         - name: exported
@@ -36,14 +33,30 @@ linters:
             - checkPrivateReceivers
             - disableStutteringCheck
 
-issues:
   exclusions:
     rules:
-      # Allow fmt.Println in main/cmd — it is intentional CLI output.
-      - path: "cmd/"
-        linters: [forbidigo]
       # Test files are exempt from some rules.
       - path: "_test\\.go"
-        linters: [gosec, gochecknoglobals]
+        linters:
+          - gosec
+          - gochecknoglobals
+      # cmd/ requires globals for Cobra (rootCmd) and ldflags version injection.
+      - path: "^cmd/"
+        linters:
+          - gochecknoglobals
+      # main.go requires globals for ldflags version injection.
+      - path: "^main\\.go$"
+        linters:
+          - gochecknoglobals
+      # ui.go uses package-level Lipgloss styles/colours — idiomatic Go.
+      - path: "^internal/ui/"
+        linters:
+          - gochecknoglobals
+      # risk.go uses a package-level immutable lookup table for dangerous ports.
+      - path: "^internal/risk/"
+        linters:
+          - gochecknoglobals
+
+issues:
   max-issues-per-linter: 0
   max-same-issues: 0

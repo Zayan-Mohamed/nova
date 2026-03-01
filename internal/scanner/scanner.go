@@ -52,7 +52,7 @@ type Port struct {
 // validIPv4 matches a bare IPv4 address.
 var validIPv4 = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
 
-// validCIDR is intentionally strict: only IPv4 CIDR /8 – /30.
+// ValidateCIDR validates a CIDR string; only IPv4 /8–/30 ranges are accepted.
 func ValidateCIDR(cidr string) error {
 	ip, network, err := net.ParseCIDR(cidr)
 	if err != nil {
@@ -313,7 +313,7 @@ func readARPCache() map[string]string {
 
 	// Linux: /proc/net/arp columns: IP, HW type, Flags, HW address, Mask, Device
 	if f, fErr := os.Open("/proc/net/arp"); fErr == nil {
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		sc := bufio.NewScanner(f)
 		sc.Scan() // discard header line
 		for sc.Scan() {

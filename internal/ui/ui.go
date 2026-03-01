@@ -96,9 +96,8 @@ type Model struct {
 	portError    string
 
 	// general
-	statusMsg string
-	spinner   int // 0-3 for spinner frames
-	isRoot    bool
+	spinner int // 0-3 for spinner frames
+	isRoot  bool
 }
 
 // menuItems list — index must stay stable; append-only.
@@ -122,7 +121,6 @@ var (
 	colorWarn     = lipgloss.Color("#FFB86C") // orange
 	colorDanger   = lipgloss.Color("#FF5555") // red
 	colorSelected = lipgloss.Color("#00D7FF") // cyan (matches accent)
-	colorBg       = lipgloss.Color("#282A36") // dark bg (dracula)
 
 	styleTitle = lipgloss.NewStyle().
 			Bold(true).
@@ -130,10 +128,6 @@ var (
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(colorPrimary).
 			Padding(0, 3)
-
-	styleSubtitle = lipgloss.NewStyle().
-			Foreground(colorMuted).
-			Italic(true)
 
 	styleSelected = lipgloss.NewStyle().
 			Foreground(colorSelected).
@@ -173,12 +167,6 @@ var (
 			BorderForeground(colorPrimary).
 			Padding(1, 3)
 
-	styleStatusBar = lipgloss.NewStyle().
-			Foreground(colorMuted).
-			BorderTop(true).
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderForeground(colorFaint)
-
 	styleHelp = lipgloss.NewStyle().
 			Foreground(colorMuted)
 
@@ -209,14 +197,6 @@ const novaASCII = `
 // center places s horizontally in a field of width w.
 func center(s string, w int) string {
 	return lipgloss.NewStyle().Width(w).Align(lipgloss.Center).Render(s)
-}
-
-// centerBlock renders a multi-line block centred in width w.
-func centerBlock(lines []string, w int) string {
-	for i, l := range lines {
-		lines[i] = center(l, w)
-	}
-	return strings.Join(lines, "\n")
 }
 
 // vcenter pads the top so that content appears vertically centred.
@@ -256,7 +236,6 @@ func (m Model) Init() tea.Cmd {
 // Update processes incoming messages and updates the model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-
 	// ── Window size ──
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -325,7 +304,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch m.state {
-
 	// ── Consent screen ──
 	case viewConsent:
 		switch key {
@@ -605,7 +583,7 @@ func (m Model) viewConsent() string {
 	logoColors := []lipgloss.Color{
 		"#BD93F9", "#A97EF5", "#9569F1", "#7B68EE", "#6754EB", "#5340E7",
 	}
-	var coloredLogo []string
+	coloredLogo := make([]string, 0, len(logoLines))
 	for i, l := range logoLines {
 		cIdx := i
 		if cIdx >= len(logoColors) {
@@ -686,7 +664,7 @@ func (m Model) viewMainMenu() string {
 	logoColors := []lipgloss.Color{
 		"#BD93F9", "#A97EF5", "#9569F1", "#7B68EE", "#6754EB", "#5340E7",
 	}
-	var coloredLogo []string
+	coloredLogo := make([]string, 0, len(logoLines))
 	for i, l := range logoLines {
 		cIdx := i
 		if cIdx >= len(logoColors) {
@@ -753,20 +731,10 @@ func (m Model) viewMainMenu() string {
 		w,
 	)
 
-	parts := []string{
-		logo,
-		tagline,
-		badge,
-		"",
-	}
+	parts := make([]string, 0, 4+len(menuCards)+5)
+	parts = append(parts, logo, tagline, badge, "")
 	parts = append(parts, menuCards...)
-	parts = append(parts,
-		"",
-		privNote,
-		subnetLine,
-		"",
-		hintLine,
-	)
+	parts = append(parts, "", privNote, subnetLine, "", hintLine)
 
 	body := strings.Join(parts, "\n")
 	bodyLines := strings.Count(body, "\n") + 1
@@ -1202,7 +1170,7 @@ func (m Model) viewHelp() string {
 		{"ctrl + c", "Quit NOVA immediately"},
 	}
 
-	var rows []string
+	rows := make([]string, 0, len(bindings))
 	for _, b := range bindings {
 		keyPart := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).
 			Render(fmt.Sprintf("  %-22s", b[0]))
@@ -1249,18 +1217,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func truncate32(s string) string {
-	return truncateRunes(s, 32)
-}
-
-func truncate20(s string) string {
-	return truncateRunes(s, 20)
-}
-
-func truncate18(s string) string {
-	return truncateRunes(s, 18)
 }
 
 func truncateRunes(s string, max int) string {

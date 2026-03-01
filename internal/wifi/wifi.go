@@ -263,7 +263,7 @@ func splitNmcliTerse(line string) []string {
 }
 
 // percentToDBm converts nmcli's 0-100 signal percentage to approximate dBm.
-// Formula: dBm = (percentage / 2) - 100
+// Formula: dBm = (percentage / 2) - 100.
 func percentToDBm(pct int) int {
 	if pct < 0 {
 		pct = 0

@@ -14,6 +14,7 @@ import (
 // Level represents a severity tier.
 type Level int
 
+// Level constants define severity tiers from informational to critical.
 const (
 	LevelInfo     Level = iota // purely informational
 	LevelLow                   // minor concern
