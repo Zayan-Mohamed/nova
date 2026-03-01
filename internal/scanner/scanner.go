@@ -207,18 +207,40 @@ func discoverWithNmap(ctx context.Context, cidr string) ([]Host, error) {
 	return parseNmapXMLHosts(stdout.String()), nil
 }
 
-// discoverWithPing sweeps the subnet by pinging every IP concurrently.
-// The system ping binary is setuid-root, so ICMP echo works without the
-// calling process needing any special privileges.
-// After the sweep, the kernel ARP cache is read for MAC addresses and
-// reverse DNS is queried for hostnames — both unprivileged operations.
+// discoverWithPing discovers hosts using a three-layer strategy so it works
+// even on networks where ICMP is blocked (corporate, university, etc.):
+//
+//  1. ARP cache — instant, requires no ICMP, works on any LAN segment.
+//     Populated by the kernel whenever the machine communicates with a host.
+//  2. ICMP ping — standard sweep for hosts not yet in ARP.
+//     Requires the system ping binary to have setuid/CAP_NET_RAW.
+//  3. TCP connect probe — for hosts that block ICMP but have open/closed TCP
+//     ports on common services (80, 22, 443, 53). "Connection refused" means
+//     the host is alive even if no port is open.
 func discoverWithPing(ctx context.Context, cidr string) ([]Host, error) {
 	ips, err := enumerateIPs(cidr)
 	if err != nil {
 		return nil, err
 	}
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
 
-	const concurrency = 50 // max simultaneous ping sub-processes
+	// ── Layer 1: ARP cache (zero-latency, ICMP-independent) ──────────────────
+	// arpTable: confirmed entries (non-zero MAC) → used for host identity + MAC.
+	// arpKnown: all entries including incomplete ones → seed for TCP probe.
+	arpTable := readARPCache()
+	arpKnown := readARPCacheKnownIPs(network)
+	upIPs := make(map[string]bool)
+	for ip := range arpTable {
+		if parsed := net.ParseIP(ip); parsed != nil && network.Contains(parsed) {
+			upIPs[ip] = true
+		}
+	}
+
+	// ── Layers 2 & 3: parallel ping + TCP probe for remaining IPs ────────────
+	const concurrency = 50
 	type pResult struct {
 		ip string
 		up bool
@@ -229,38 +251,44 @@ func discoverWithPing(ctx context.Context, cidr string) ([]Host, error) {
 	var wg sync.WaitGroup
 outerLoop:
 	for _, ip := range ips {
+		if upIPs[ip] {
+			continue // already confirmed via ARP
+		}
 		select {
 		case <-ctx.Done():
 			break outerLoop
-		case sem <- struct{}{}: // acquire a concurrency slot
+		case sem <- struct{}{}: // acquire concurrency slot
 		}
 		wg.Add(1)
 		go func(ip string) {
 			defer wg.Done()
-			defer func() { <-sem }() // release slot
-			// Per-host deadline; the parent ctx kills the whole sweep if needed.
-			pCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(pCtx, "ping", "-c", "1", ip)
-			results <- pResult{ip: ip, up: cmd.Run() == nil}
+			defer func() { <-sem }()
+			// Hosts in incomplete ARP entries are known to the network; skip the
+			// slow ICMP sweep and go straight to the faster TCP probe.
+			var up bool
+			if arpKnown[ip] {
+				up = tcpProbe(ctx, ip)
+			} else {
+				up = icmpProbe(ctx, ip) || tcpProbe(ctx, ip)
+			}
+			results <- pResult{ip: ip, up: up}
 		}(ip)
 	}
 	go func() { wg.Wait(); close(results) }()
 
-	var upIPs []string
 	for r := range results {
 		if r.up {
-			upIPs = append(upIPs, r.ip)
+			upIPs[r.ip] = true
 		}
 	}
+
 	if len(upIPs) == 0 {
 		return nil, nil
 	}
 
-	// Enrich with MAC (ARP cache) and hostname (reverse DNS).
-	arpTable := readARPCache()
+	// Enrich with hostname (reverse DNS). MAC already in arpTable.
 	hosts := make([]Host, 0, len(upIPs))
-	for _, ip := range upIPs {
+	for ip := range upIPs {
 		h := Host{IP: ip}
 		if mac, ok := arpTable[ip]; ok {
 			h.MAC = mac
@@ -271,6 +299,35 @@ outerLoop:
 		hosts = append(hosts, h)
 	}
 	return hosts, nil
+}
+
+// icmpProbe sends a single ICMP echo request and returns true if the host
+// responds within 1 second. Requires setuid/CAP_NET_RAW on the ping binary.
+func icmpProbe(ctx context.Context, ip string) bool {
+	pCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	// -W 1: wait at most 1 s for a reply (avoids default 10-s wait on some distros).
+	return exec.CommandContext(pCtx, "ping", "-c", "1", "-W", "1", ip).Run() == nil
+}
+
+// tcpProbe tries TCP connects on common ports. A refused connection proves
+// the remote TCP stack is alive even when ICMP is blocked by a firewall.
+func tcpProbe(ctx context.Context, ip string) bool {
+	for _, port := range []int{80, 22, 443, 53} {
+		addr := fmt.Sprintf("%s:%d", ip, port)
+		pCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		conn, dialErr := (&net.Dialer{}).DialContext(pCtx, "tcp", addr)
+		cancel()
+		if conn != nil {
+			_ = conn.Close()
+			return true // port open = host alive
+		}
+		// "connection refused" = host alive, port merely closed.
+		if dialErr != nil && strings.Contains(dialErr.Error(), "connection refused") {
+			return true
+		}
+	}
+	return false
 }
 
 // enumerateIPs returns all usable host IPs within cidr, excluding the network
@@ -305,12 +362,38 @@ func enumerateIPs(cidr string) ([]string, error) {
 	return ips, nil
 }
 
-// readARPCache returns a map of IPv4 address → sanitised MAC address.
+// ─── ARP helpers ──────────────────────────────────────────────────────────────
+
+// readARPCache returns a map of IPv4 address → sanitised MAC address for
+// all complete ARP entries (i.e. confirmed hosts with a non-zero MAC).
 // It reads /proc/net/arp directly on Linux (no subprocess, no privileges)
 // and falls back to running `arp -an` on macOS / BSD.
 func readARPCache() map[string]string {
 	table := make(map[string]string)
+	readARPCacheInto(table, true)
+	return table
+}
 
+// readARPCacheKnownIPs returns the set of all IP addresses that appear in the
+// kernel ARP table — including incomplete entries (flags 0x0) that have no
+// confirmed MAC yet. This lets us probe hosts the kernel knows about even when
+// ICMP is blocked and the ARP handshake has not yet completed.
+func readARPCacheKnownIPs(network *net.IPNet) map[string]bool {
+	known := make(map[string]bool)
+	raw := make(map[string]string) // ip → raw MAC (may be all-zero)
+	readARPCacheInto(raw, false)
+	for ip := range raw {
+		if parsed := net.ParseIP(ip); parsed != nil && network.Contains(parsed) {
+			known[ip] = true
+		}
+	}
+	return known
+}
+
+// readARPCacheInto populates dst.  If onlyComplete is true only entries with a
+// valid non-zero MAC are stored; otherwise all entries are stored (with the raw
+// MAC value, which may be "00:00:00:00:00:00" for incomplete entries).
+func readARPCacheInto(dst map[string]string, onlyComplete bool) {
 	// Linux: /proc/net/arp columns: IP, HW type, Flags, HW address, Mask, Device
 	if f, fErr := os.Open("/proc/net/arp"); fErr == nil {
 		defer func() { _ = f.Close() }()
@@ -322,32 +405,50 @@ func readARPCache() map[string]string {
 				continue
 			}
 			ip := sanitizeIP(fields[0])
-			mac := sanitizeMAC(strings.ToUpper(fields[3]))
-			if ip != "" && mac != "" && mac != "00:00:00:00:00:00" {
-				table[ip] = mac
+			if ip == "" {
+				continue
+			}
+			mac := strings.ToUpper(strings.TrimSpace(fields[3]))
+			if onlyComplete {
+				mac = sanitizeMAC(mac)
+				if mac == "" || mac == "00:00:00:00:00:00" {
+					continue
+				}
+				dst[ip] = mac
+			} else {
+				// Keep all entries so we know the host's IP exists in the ARP table.
+				dst[ip] = mac
 			}
 		}
-		return table
+		return
 	}
 
 	// macOS / BSD fallback: arp -an
 	// Example line: ? (10.0.0.1) at a4:b1:e9:xx:xx:xx on en0 ifscope ...
 	out, aErr := exec.Command("arp", "-an").Output()
 	if aErr != nil {
-		return table
+		return
 	}
 	arpRe := regexp.MustCompile(`\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([0-9a-fA-F:]{17})`)
 	for _, line := range strings.Split(string(out), "\n") {
 		m := arpRe.FindStringSubmatch(line)
 		if len(m) == 3 {
 			ip := sanitizeIP(m[1])
-			mac := sanitizeMAC(strings.ToUpper(m[2]))
-			if ip != "" && mac != "" {
-				table[ip] = mac
+			if ip == "" {
+				continue
+			}
+			mac := strings.ToUpper(m[2])
+			if onlyComplete {
+				mac = sanitizeMAC(mac)
+				if mac == "" || mac == "00:00:00:00:00:00" {
+					continue
+				}
+				dst[ip] = mac
+			} else {
+				dst[ip] = mac
 			}
 		}
 	}
-	return table
 }
 
 // ─── Port Scanning ───────────────────────────────────────────────────────────
