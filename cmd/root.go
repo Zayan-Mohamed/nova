@@ -22,10 +22,18 @@ var (
 )
 
 // SetVersionInfo is called by main to inject build-time version metadata.
+// It must also update rootCmd.Version and the version template because rootCmd
+// is initialised as a package-level variable (before main runs), so the
+// Version field and SetVersionTemplate call in init() both see the default
+// "dev" / "none" / "unknown" values — not the ldflags-injected ones.
 func SetVersionInfo(version, commit, date string) {
 	appVersion = version
 	appCommit = commit
 	appDate = date
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate(
+		"NOVA {{.Version}} (commit: " + commit + ", built: " + date + ")\n",
+	)
 }
 
 // flagCIDR holds the value of the --subnet flag.
