@@ -6,3 +6,6 @@ nova
 
 build/
 dist/
+
+# MkDocs build output
+site/

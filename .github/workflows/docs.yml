@@ -1,0 +1,40 @@
+name: Docs
+
+on:
+    push:
+        branches: ["main"]
+    workflow_dispatch: # allow manual trigger from GitHub UI
+
+permissions:
+    contents: write # needed to push to gh-pages branch
+
+jobs:
+    deploy:
+        name: Build & Deploy Docs
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0 # full history for accurate git metadata
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.x"
+                  cache: pip
+
+            - name: Install MkDocs Material
+              run: |
+                  pip install \
+                    "mkdocs>=1.5,<2.0" \
+                    "mkdocs-material>=9,<10" \
+                    pymdown-extensions
+
+            - name: Configure git identity
+              run: |
+                  git config user.name  "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            - name: Build and deploy to gh-pages
+              run: mkdocs gh-deploy --force --clean --verbose

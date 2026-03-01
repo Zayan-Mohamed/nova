@@ -1,0 +1,93 @@
+site_name: NOVA
+site_description: Network Observation & Vulnerability Analyzer — terminal-based defensive network security tool
+site_author: Zayan Mohamed
+site_url: https://zayan-mohamed.github.io/nova/
+
+repo_url: https://github.com/Zayan-Mohamed/nova
+repo_name: Zayan-Mohamed/nova
+edit_uri: edit/main/docs/
+
+copyright: Copyright &copy; 2026 Zayan Mohamed — MIT License
+
+theme:
+  name: material
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: cyan
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: deep purple
+      accent: cyan
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/shield-search
+  favicon: assets/favicon.png
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - Features:
+      - WiFi Analysis: features/wifi-analysis.md
+      - LAN Discovery: features/lan-discovery.md
+      - Port Scanning: features/port-scanning.md
+      - Risk Scoring: features/risk-scoring.md
+  - Reference:
+      - CLI Reference: reference/cli.md
+      - Key Bindings: reference/keybindings.md
+      - Architecture: reference/architecture.md
+  - Contributing: contributing.md
+  - Security: security.md
+  - Changelog: changelog.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Zayan-Mohamed/nova
+  version:
+    provider: mike
