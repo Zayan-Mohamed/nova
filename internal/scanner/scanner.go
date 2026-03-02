@@ -12,15 +12,20 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"sync"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
 
 // scanTimeout is the maximum time granted to a single nmap invocation.
 const scanTimeout = 60 * time.Second
+
+// deepScanTimeout allows more time for service probing, OS detection, and NSE
+// scripts. Kept at 3 minutes — long enough for version probes against slow
+// services, short enough to prevent indefinite blocking.
+const deepScanTimeout = 3 * 60 * time.Second
 
 // maxHosts is the maximum number of host results we will process to prevent
 // memory exhaustion from maliciously crafted or unexpectedly large outputs.
@@ -41,6 +46,11 @@ type Host struct {
 	Vendor    string
 	OpenPorts []Port
 	OS        string // best-guess OS fingerprint (read-only, no exploitation)
+
+	// Deep-scan enrichment fields.
+	OSAccuracy  int    // 0–100 confidence from nmap OS detection
+	DeviceType  string // e.g. "router", "phone", "general purpose"
+	NetworkDist int    // network hop distance (TTL-derived)
 }
 
 // Port represents an open TCP/UDP port on a host.
@@ -49,6 +59,25 @@ type Port struct {
 	Protocol string // "tcp" or "udp"
 	Service  string
 	State    string // "open", "filtered"
+
+	// Deep-scan fields (populated by DeepScan only).
+	Product string         // e.g. "OpenSSH", "Apache httpd"
+	Version string         // e.g. "7.4", "2.4.41"
+	Extra   string         // extra info from nmap -sV
+	CPE     string         // Common Platform Enumeration string
+	Scripts []ScriptResult // NSE script output
+}
+
+// ScriptResult holds the output of a single NSE script run against a port.
+type ScriptResult struct {
+	ID     string // e.g. "http-title", "ssl-cert"
+	Output string // sanitised script output
+}
+
+// DeepScanResult holds the complete intelligence gathered by DeepScan.
+type DeepScanResult struct {
+	Host      Host
+	RawOutput string // sanitised nmap output for advanced display
 }
 
 // ─── Input validation ─────────────────────────────────────────────────────────
@@ -158,6 +187,69 @@ func sanitizeProtocol(s string) string {
 	default:
 		return "tcp"
 	}
+}
+
+// ─── Gateway detection ────────────────────────────────────────────────────────
+
+// DetectDefaultGatewayIP returns the IPv4 address of the system's default
+// gateway by reading /proc/net/route (Linux) or running `route get default`
+// (macOS/BSD). Returns empty string if it cannot be determined.
+//
+// The value is sanitised through net.ParseIP so it is always a canonical
+// dotted-decimal string and cannot contain shell-injection characters.
+func DetectDefaultGatewayIP() string {
+	// Linux: /proc/net/route
+	// Columns: Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+	// All numeric fields are 8-char zero-padded little-endian hex uint32.
+	if f, err := os.Open("/proc/net/route"); err == nil {
+		defer func() { _ = f.Close() }()
+		sc := bufio.NewScanner(f)
+		sc.Scan() // skip header
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) < 3 {
+				continue
+			}
+			// Default route: Destination == "00000000"
+			if fields[1] != "00000000" {
+				continue
+			}
+			gwHex := fields[2]
+			if len(gwHex) != 8 {
+				continue
+			}
+			// Parse 4 little-endian bytes.
+			var b [4]byte
+			for i := 0; i < 4; i++ {
+				val, err := strconv.ParseUint(gwHex[i*2:i*2+2], 16, 8)
+				if err != nil {
+					b = [4]byte{}
+					break
+				}
+				b[i] = byte(val)
+			}
+			// Kernel stores in little-endian order: b[0]=LSB → reverse for network order.
+			ip := net.IPv4(b[3], b[2], b[1], b[0])
+			if s := sanitizeIP(ip.String()); s != "" {
+				return s
+			}
+		}
+	}
+	// macOS / BSD fallback: `route get default`
+	out, err := exec.Command("route", "get", "default").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			s := sanitizeIP(strings.TrimSpace(strings.TrimPrefix(line, "gateway:")))
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 // ─── Host Discovery ───────────────────────────────────────────────────────────
@@ -487,6 +579,287 @@ func PortScan(ctx context.Context, ip string, ports string, isRoot bool) ([]Port
 	return parseNmapXMLPorts(stdout.String()), nil
 }
 
+// DeepScan performs a thorough, Host intelligence scan.
+//
+// It combines:
+//   - Full TCP port sweep (1–65535)
+//   - Service & version detection (-sV --version-intensity 7)
+//   - OS fingerprinting (-O --osscan-guess)
+//   - Default NSE safe scripts (-sC) for service intelligence:
+//     http-title, ssh-hostkey, ssl-cert, smb-os-discovery, dns-service-discovery
+//     banner, http-server-header, snmp-info, upnp-info, and more.
+//   - UDP scan on high-value ports (161/SNMP, 1900/UPnP, 5353/mDNS, 67/DHCP)
+//     to detect router/mobile-hotspot services invisible to TCP.
+//
+// isRoot must be set when os.Getuid() == 0. Root enables SYN scanning (-sS)
+// and raw-socket OS detection; without root, TCP connect (-sT) is used and OS
+// detection is downgraded to TTL-based guessing only.
+//
+// Safe-by-design: no exploit scripts, no brute-force, --script-args is not
+// exposed to user input, and all output is sanitised before returning.
+func DeepScan(ctx context.Context, ip string, isRoot bool) (*DeepScanResult, error) {
+	if err := ValidateIP(ip); err != nil {
+		return nil, err
+	}
+
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, deepScanTimeout)
+		defer cancel()
+	}
+
+	// ── TCP deep scan ──────────────────────────────────────────────────────
+	// Scan all 65535 TCP ports so we catch non-standard service ports that
+	// would be invisible in the default 1-1024 range (e.g. mobile-hotspot
+	// admin panels on 7547, 8888; IoT devices on 9090, 49152+).
+	scanType := "-sT" // TCP connect — no root required
+	if isRoot {
+		scanType = "-sS" // SYN scan — faster, stealthier
+	}
+
+	// NSE safe-scripts category only. Explicitly excluded categories:
+	// exploit, brute, dos, intrusive, malware — in line with NOVA's
+	// defensive philosophy. The "safe" and "discovery" categories are
+	// read-only and produce no side-effects on the target.
+	// Individual scripts augment the basic discovery with service-specific
+	// intelligence useful for router/hotspot profiling:
+	//   http-title        – web admin panel title
+	//   http-server-header – software version in HTTP Server: header
+	//   ssl-cert          – TLS certificate info (CN, expiry)
+	//   ssh-hostkey       – SSH host key fingerprint
+	//   smb-os-discovery  – Windows/Samba version via SMB
+	//   dns-service-discovery – mDNS/DNS-SD service list (Apple Bonjour, etc.)
+	//   banner            – raw TCP banner grab
+	//   snmp-info         – SNMP sysDescr (read community string "public")
+	//   upnp-info         – UPnP root device description
+	//   nbstat            – NetBIOS name/workgroup
+	scriptList := strings.Join([]string{
+		"http-title",
+		"http-server-header",
+		"ssl-cert",
+		"ssh-hostkey",
+		"smb-os-discovery",
+		"dns-service-discovery",
+		"banner",
+		"snmp-info",
+		"upnp-info",
+		"nbstat",
+	}, ",")
+
+	// -Pn: treat target as up even when ICMP probes are blocked.
+	// This is ESSENTIAL for mobile hotspots: Android iptables drops ICMP
+	// echo-request on the tethering interface by default, so without -Pn
+	// nmap marks the host "down" and never scans its ports. We already know
+	// the host is up (the user selected it from the discovery list), so
+	// skipping host-discovery here is always correct.
+	tcpArgs := []string{
+		scanType,
+		"-Pn",
+		"-sV", "--version-intensity", "7",
+		"--osscan-guess",
+		"--script", scriptList,
+		"--open",
+		"-p", "1-65535",
+		"-T4",
+		"--host-timeout", "120s",
+		"-oX", "-",
+		ip,
+	}
+	// -O (raw OS detection) requires root and at least one open + one closed
+	// port.  Add it only when we have the necessary privileges.
+	if isRoot {
+		// Insert -O right after the scan type flag.
+		updated := make([]string, 0, len(tcpArgs)+1)
+		updated = append(updated, tcpArgs[0]) // scanType
+		updated = append(updated, "-O")
+		updated = append(updated, tcpArgs[1:]...)
+		tcpArgs = updated
+	}
+
+	cmd := exec.CommandContext(ctx, "nmap", tcpArgs...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if runErr := cmd.Run(); runErr != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("deep scan timed out after %v", deepScanTimeout)
+		}
+		if stdout.Len() == 0 {
+			return nil, fmt.Errorf("nmap deep scan failed: %w", runErr)
+		}
+		// Partial output — parse what we have.
+	}
+
+	tcpXML := stdout.String()
+
+	// ── UDP high-value port scan ───────────────────────────────────────────
+	// UDP exposes services that are exclusively UDP-based and are critical
+	// for router/hotspot intelligence:
+	//   67  DHCP server  – confirms this is a gateway/hotspot
+	//   161 SNMP         – device description, firmware, uptime
+	//   1900 UPnP/SSDP  – device type, friendly name, model
+	//   5353 mDNS        – hostname, service list via DNS-SD
+	var udpXML string
+	if isRoot {
+		udpCtx, udpCancel := context.WithTimeout(ctx, 40*time.Second)
+		defer udpCancel()
+		udpArgs := []string{
+			"-sU",
+			"-sV", "--version-intensity", "5",
+			"--script", "snmp-info,upnp-info,dns-service-discovery",
+			"--open",
+			"-p", "67,161,1900,5353",
+			"-T4",
+			"--host-timeout", "30s",
+			"-oX", "-",
+			ip,
+		}
+		udpCmd := exec.CommandContext(udpCtx, "nmap", udpArgs...)
+		var udpOut bytes.Buffer
+		udpCmd.Stdout = &udpOut
+		_ = udpCmd.Run() // errors are non-fatal; UDP often returns partial data
+		udpXML = udpOut.String()
+	}
+
+	// ── Parse and merge ────────────────────────────────────────────────────
+	hosts := parseNmapXMLHostsDeep(tcpXML)
+	if len(hosts) == 0 {
+		// Host may be blocking all TCP; add a stub so UDP results attach.
+		hosts = []Host{{IP: ip}}
+	}
+	h := hosts[0]
+
+	if udpXML != "" {
+		udpHosts := parseNmapXMLHostsDeep(udpXML)
+		if len(udpHosts) > 0 {
+			for _, p := range udpHosts[0].OpenPorts {
+				if len(h.OpenPorts) < maxOpenPorts {
+					h.OpenPorts = append(h.OpenPorts, p)
+				}
+			}
+			// Prefer UDP-derived device type for routers/APs.
+			if h.DeviceType == "" && udpHosts[0].DeviceType != "" {
+				h.DeviceType = udpHosts[0].DeviceType
+			}
+		}
+	}
+
+	// ── Hotspot / gateway extra TCP probe ─────────────────────────────────
+	// Mobile hotspots (Android, iPhone, MiFi) and routers often expose admin
+	// panels on non-standard ports that are NOT in the 1-1024 standard range
+	// AND are filtered from the main full scan by iptables rules that only
+	// allow connections from the local subnet's admin interface.
+	// We do a fast targeted connect-scan on the most common admin/management
+	// ports.  -Pn is essential (ICMP still blocked here).  Timeout is short
+	// (15 s) so this doesn't materially extend scan time.
+	hotspotAdminPorts := "80,443,7547,8080,8081,8443,8888,9090,4040,5985,49152,49153"
+	hotspotCtx, hotspotCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer hotspotCancel()
+	hotspotArgs := []string{
+		"-sT", // TCP connect — works without root
+		"-Pn",
+		"-sV", "--version-intensity", "3",
+		"--script", "http-title,http-server-header,upnp-info,banner",
+		"--open",
+		"-p", hotspotAdminPorts,
+		"-T4",
+		"--host-timeout", "15s",
+		"-oX", "-",
+		ip,
+	}
+	hotspotCmd := exec.CommandContext(hotspotCtx, "nmap", hotspotArgs...)
+	var hotspotOut bytes.Buffer
+	hotspotCmd.Stdout = &hotspotOut
+	_ = hotspotCmd.Run() // non-fatal; enriches existing results
+	if hotspotOut.Len() > 0 {
+		hotspotHosts := parseNmapXMLHostsDeep(hotspotOut.String())
+		if len(hotspotHosts) > 0 {
+			for _, p := range hotspotHosts[0].OpenPorts {
+				// Only add ports not already found by the main scan.
+				alreadyFound := false
+				for _, existing := range h.OpenPorts {
+					if existing.Number == p.Number && existing.Protocol == p.Protocol {
+						alreadyFound = true
+						break
+					}
+				}
+				if !alreadyFound && len(h.OpenPorts) < maxOpenPorts {
+					h.OpenPorts = append(h.OpenPorts, p)
+				}
+			}
+		}
+	}
+
+	// ── Auto-detect if this is the default gateway ─────────────────────────
+	if gwIP := DetectDefaultGatewayIP(); gwIP == h.IP && h.DeviceType == "" {
+		// This host is the default gateway (router / hotspot).
+		// We'll mark it so the risk analyser can apply gateway-specific rules.
+		h.DeviceType = "gateway"
+	}
+
+	// Enrich from ARP cache for MAC/vendor if not already populated.
+	arpTable := readARPCache()
+	if h.MAC == "" {
+		if mac, ok := arpTable[h.IP]; ok {
+			h.MAC = mac
+		}
+	}
+
+	// Build a compact human-readable summary for the raw output field.
+	rawSummary := buildRawSummary(h)
+
+	return &DeepScanResult{
+		Host:      h,
+		RawOutput: rawSummary,
+	}, nil
+}
+
+// buildRawSummary creates a concise, sanitised plain-text overview of the
+// deep scan result suitable for display in the TUI details pane.
+func buildRawSummary(h Host) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Host: %s\n", h.IP)
+	if h.Hostname != "" {
+		fmt.Fprintf(&sb, "Hostname: %s\n", h.Hostname)
+	}
+	if h.MAC != "" {
+		fmt.Fprintf(&sb, "MAC: %s", h.MAC)
+		if h.Vendor != "" {
+			sb.WriteString(" (" + h.Vendor + ")")
+		}
+		sb.WriteString("\n")
+	}
+	if h.OS != "" {
+		acc := ""
+		if h.OSAccuracy > 0 {
+			acc = fmt.Sprintf(" [%d%%]", h.OSAccuracy)
+		}
+		fmt.Fprintf(&sb, "OS: %s%s\n", h.OS, acc)
+	}
+	if h.DeviceType != "" {
+		fmt.Fprintf(&sb, "Device: %s\n", h.DeviceType)
+	}
+	fmt.Fprintf(&sb, "Open Ports: %d\n", len(h.OpenPorts))
+	for _, p := range h.OpenPorts {
+		line := fmt.Sprintf("  %d/%s\t%s", p.Number, p.Protocol, p.Service)
+		if p.Product != "" {
+			line += " " + p.Product
+		}
+		if p.Version != "" {
+			line += " " + p.Version
+		}
+		if p.Extra != "" {
+			line += " (" + p.Extra + ")"
+		}
+		sb.WriteString(line + "\n")
+		for _, s := range p.Scripts {
+			fmt.Fprintf(&sb, "    [%s]: %s\n", s.ID, s.Output)
+		}
+	}
+	return sb.String()
+}
+
 // validatePortRange accepts expressions like "22,80,443" or "1-1024" or "22".
 // It rejects anything that could be used for shell injection.
 var validPortRange = regexp.MustCompile(`^[0-9,\-]+$`)
@@ -640,6 +1013,156 @@ func parseNmapXMLPorts(xmlData string) []Port {
 		portCount++
 	}
 	return ports
+}
+
+// parseNmapXMLHostsDeep is like parseNmapXMLHosts but also captures
+// service version, product, extra, CPE, NSE script output, OS accuracy,
+// and device type — all fields written by -sV -O --script scans.
+func parseNmapXMLHostsDeep(xmlData string) []Host {
+	var hosts []Host
+	sc := bufio.NewScanner(strings.NewReader(xmlData))
+	// nmap XML can have very long <script output=...> lines; increase buffer.
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+
+	var current *Host
+	var currentPort *Port
+	count := 0
+
+	for sc.Scan() {
+		if count >= maxHosts {
+			break
+		}
+		line := strings.TrimSpace(sc.Text())
+
+		switch {
+		case strings.HasPrefix(line, "<host ") || line == "<host>":
+			current = &Host{}
+			currentPort = nil
+			count++
+
+		case line == "</host>":
+			if currentPort != nil && current != nil {
+				if len(current.OpenPorts) < maxOpenPorts {
+					current.OpenPorts = append(current.OpenPorts, *currentPort)
+				}
+				currentPort = nil
+			}
+			if current != nil && current.IP != "" {
+				hosts = append(hosts, *current)
+			}
+			current = nil
+
+		case current == nil:
+			continue
+
+		// ── address ──
+		case strings.Contains(line, "<address addr="):
+			addr, addrType := extractAttr(line, "addr"), extractAttr(line, "addrtype")
+			switch addrType {
+			case "ipv4":
+				if ip := sanitizeIP(addr); ip != "" {
+					current.IP = ip
+				}
+			case "mac":
+				if mac := sanitizeMAC(addr); mac != "" {
+					current.MAC = mac
+					current.Vendor = sanitizeField(extractAttr(line, "vendor"))
+				}
+			}
+
+		// ── hostname ──
+		case strings.Contains(line, "<hostname "):
+			name := sanitizeField(extractAttr(line, "name"))
+			if name != "" && current.Hostname == "" {
+				current.Hostname = name
+			}
+
+		// ── OS match ──
+		case strings.Contains(line, "<osmatch "):
+			name := sanitizeField(extractAttr(line, "name"))
+			accStr := extractAttr(line, "accuracy")
+			acc, _ := strconv.Atoi(accStr)
+			if name != "" && current.OS == "" {
+				current.OS = name
+				current.OSAccuracy = acc
+			}
+
+		// ── OS class (device type) ──
+		case strings.Contains(line, "<osclass "):
+			dt := sanitizeField(extractAttr(line, "type"))
+			if dt != "" && current.DeviceType == "" {
+				current.DeviceType = strings.ToLower(dt)
+			}
+
+		// ── port open ──
+		case strings.HasPrefix(line, "<port "):
+			// Commit previous port if still pending.
+			if currentPort != nil {
+				if len(current.OpenPorts) < maxOpenPorts {
+					current.OpenPorts = append(current.OpenPorts, *currentPort)
+				}
+			}
+			portNum, err := strconv.Atoi(extractAttr(line, "portid"))
+			if err != nil {
+				currentPort = nil
+				continue
+			}
+			portNum = sanitizePort(portNum)
+			if portNum == 0 {
+				currentPort = nil
+				continue
+			}
+			currentPort = &Port{
+				Number:   portNum,
+				Protocol: sanitizeProtocol(extractAttr(line, "protocol")),
+			}
+
+		// ── port state ──
+		case strings.HasPrefix(line, "<state ") && currentPort != nil:
+			s := extractAttr(line, "state")
+			if s == "open" || s == "filtered" {
+				currentPort.State = s
+			}
+
+		// ── service version ──
+		case strings.HasPrefix(line, "<service ") && currentPort != nil:
+			currentPort.Service = sanitizeField(extractAttr(line, "name"))
+			currentPort.Product = sanitizeField(extractAttr(line, "product"))
+			currentPort.Version = sanitizeField(extractAttr(line, "version"))
+			currentPort.Extra = sanitizeField(extractAttr(line, "extrainfo"))
+
+		// ── CPE ──
+		case strings.HasPrefix(line, "<cpe>") && currentPort != nil:
+			// <cpe>cpe:/a:openbsd:openssh:7.4</cpe>
+			start := strings.Index(line, "<cpe>")
+			end := strings.Index(line, "</cpe>")
+			if start >= 0 && end > start+5 {
+				currentPort.CPE = sanitizeField(line[start+5 : end])
+			}
+
+		// ── NSE script output ──
+		case strings.HasPrefix(line, "<script ") && currentPort != nil:
+			scriptID := sanitizeField(extractAttr(line, "id"))
+			scriptOut := sanitizeField(extractAttr(line, "output"))
+			if scriptID != "" && len(currentPort.Scripts) < 16 {
+				currentPort.Scripts = append(currentPort.Scripts, ScriptResult{
+					ID:     scriptID,
+					Output: scriptOut,
+				})
+			}
+
+		// ── end port ──
+		case line == "</port>" && currentPort != nil:
+			if currentPort.State == "" {
+				currentPort.State = "open"
+			}
+			if len(current.OpenPorts) < maxOpenPorts {
+				current.OpenPorts = append(current.OpenPorts, *currentPort)
+			}
+			currentPort = nil
+		}
+	}
+	return hosts
 }
 
 // extractAttr extracts the value of a named XML attribute from a line.

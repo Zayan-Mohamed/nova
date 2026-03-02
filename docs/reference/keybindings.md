@@ -68,8 +68,20 @@
 
 | Key         | Action                        |
 | ----------- | ----------------------------- |
+| `d`         | Launch Deep Scan on this host |
 | `r`         | Re-run port scan on this host |
 | `Esc` / `q` | Return to host list           |
+
+---
+
+## Deep Scan view
+
+| Key         | Action                        |
+| ----------- | ----------------------------- |
+| `↑` / `k`   | Scroll port table up          |
+| `↓` / `j`   | Scroll port table down        |
+| `r`         | Re-run deep scan on this host |
+| `Esc` / `q` | Return to host detail view    |
 
 ---
 

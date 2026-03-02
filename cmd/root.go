@@ -4,9 +4,11 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -47,21 +49,40 @@ var virtualIfacePrefixes = []string{
 	"tun", "tap", "wg", "utun", "vpn", "dummy", "bond", "team",
 }
 
-// defaultCIDR detects the subnet of the active physical network interface
-// (WiFi or Ethernet). It skips loopback and well-known virtual/container
-// interfaces, then uses the interface's real network mask — not a forced /24.
-// Falls back to 192.168.1.0/24 if nothing suitable is found.
+// defaultCIDR returns the subnet of the interface that carries the default
+// route (i.e. the one actually routing traffic to the internet — the hotspot
+// WiFi adapter, the tethering USB interface, etc.).
+//
+// Strategy:
+//  1. Read the kernel routing table (/proc/net/route on Linux) to find which
+//     interface has the 0.0.0.0/0 (default) route.  This is the definitive
+//     answer and correctly handles the case where both Ethernet and WiFi are
+//     up simultaneously but only the hotspot is the active internet path.
+//  2. On macOS / BSD, fall back to running `route get default` and parsing
+//     the "interface:" line.
+//  3. If both fail, iterate interfaces by index (original behaviour).
 func defaultCIDR() string {
+	// ── Linux: read routing table ──────────────────────────────────────────
+	if iface := defaultRouteIfaceLinux(); iface != "" {
+		if cidr := subnetForIface(iface); cidr != "" {
+			return cidr
+		}
+	}
+	// ── macOS / BSD fallback ───────────────────────────────────────────────
+	if iface := defaultRouteIfaceMacOS(); iface != "" {
+		if cidr := subnetForIface(iface); cidr != "" {
+			return cidr
+		}
+	}
+	// ── Interface-iteration fallback (original behaviour) ─────────────────
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "192.168.1.0/24"
 	}
 	for _, iface := range ifaces {
-		// Must be up and not loopback.
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		// Skip virtual / container / VPN interfaces.
 		name := strings.ToLower(iface.Name)
 		virtual := false
 		for _, prefix := range virtualIfacePrefixes {
@@ -73,28 +94,78 @@ func defaultCIDR() string {
 		if virtual {
 			continue
 		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			ip := ipNet.IP.To4()
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-			// Use the actual subnet mask the interface was assigned,
-			// not a forced /24 — a home router might give /24 but a
-			// corporate network or VPN often uses /22, /23, etc.
-			network := ip.Mask(ipNet.Mask)
-			ones, _ := ipNet.Mask.Size()
-			return fmt.Sprintf("%s/%d", network.String(), ones)
+		if cidr := subnetForIface(iface.Name); cidr != "" {
+			return cidr
 		}
 	}
 	return "192.168.1.0/24"
+}
+
+// defaultRouteIfaceLinux reads /proc/net/route and returns the name of the
+// interface that owns the 0.0.0.0/0 (default) route.
+// The Destination column is a little-endian hex uint32; "00000000" = 0.0.0.0.
+func defaultRouteIfaceLinux() string {
+	f, err := os.Open("/proc/net/route")
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	sc.Scan() // discard header line
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 {
+			continue
+		}
+		// Column 1 = Destination; "00000000" is the default route.
+		if fields[1] == "00000000" {
+			return fields[0] // column 0 = Iface
+		}
+	}
+	return ""
+}
+
+// defaultRouteIfaceMacOS runs `route get default` and extracts the interface
+// name from the "interface:" line. Returns empty string on failure.
+func defaultRouteIfaceMacOS() string {
+	out, err := exec.Command("route", "get", "default").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "interface:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "interface:"))
+		}
+	}
+	return ""
+}
+
+// subnetForIface returns the IPv4 CIDR network string for the named interface
+// (e.g. "10.204.230.0/24"). Returns empty string if not found / not IPv4.
+func subnetForIface(name string) string {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return ""
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP.To4()
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		network := ip.Mask(ipNet.Mask)
+		ones, _ := ipNet.Mask.Size()
+		return fmt.Sprintf("%s/%d", network.String(), ones)
+	}
+	return ""
 }
 
 var rootCmd = &cobra.Command{

@@ -29,6 +29,7 @@ const (
 	viewWiFi                        // WiFi scan results
 	viewHosts                       // LAN host discovery results
 	viewHostDetail                  // single-host port/risk detail
+	viewDeepScan                    // full deep scan intelligence view
 	viewHelp                        // key bindings
 )
 
@@ -51,6 +52,13 @@ type portScanDoneMsg struct {
 	ip    string
 	ports []scanner.Port
 	err   error
+}
+
+// deepScanDoneMsg is sent when a deep scan of a single host completes.
+type deepScanDoneMsg struct {
+	result *scanner.DeepScanResult
+	report risk.HostReport
+	err    error
 }
 
 // tickMsg drives the loading animation.
@@ -94,6 +102,13 @@ type Model struct {
 	selectedHost *risk.HostReport
 	portLoading  bool
 	portError    string
+
+	// deep scan
+	deepScanResult  *scanner.DeepScanResult
+	deepScanReport  *risk.HostReport
+	deepScanLoading bool
+	deepScanError   string
+	deepScanScrollY int // vertical scroll offset for the detail pane
 
 	// general
 	spinner int // 0-3 for spinner frames
@@ -286,6 +301,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	// ── Deep scan result ──
+	case deepScanDoneMsg:
+		m.deepScanLoading = false
+		if msg.err != nil {
+			m.deepScanError = msg.err.Error()
+		} else {
+			m.deepScanResult = msg.result
+			report := msg.report
+			m.deepScanReport = &report
+			m.deepScanError = ""
+			m.deepScanScrollY = 0
+		}
+		return m, nil
+
 	// ── Keyboard ──
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -435,10 +464,45 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// ── Host detail view ──
 	case viewHostDetail:
 		switch key {
+		case "d", "D":
+			// Launch deep scan from the host detail view.
+			if m.selectedHost != nil && !m.deepScanLoading {
+				m.state = viewDeepScan
+				m.deepScanLoading = true
+				m.deepScanError = ""
+				m.deepScanResult = nil
+				m.deepScanReport = nil
+				m.deepScanScrollY = 0
+				return m, runDeepScan(m.selectedHost.Host.IP, m.isRoot)
+			}
 		case "esc", "q":
 			m.state = viewHosts
 			m.selectedHost = nil
 			m.portError = ""
+		}
+
+	// ── Deep scan view ──
+	case viewDeepScan:
+		switch key {
+		case "up", "k":
+			if m.deepScanScrollY > 0 {
+				m.deepScanScrollY--
+			}
+		case "down", "j":
+			m.deepScanScrollY++
+		case "r":
+			if m.deepScanReport != nil && !m.deepScanLoading {
+				ip := m.deepScanReport.Host.IP
+				m.deepScanLoading = true
+				m.deepScanError = ""
+				m.deepScanResult = nil
+				m.deepScanReport = nil
+				m.deepScanScrollY = 0
+				return m, runDeepScan(ip, m.isRoot)
+			}
+		case "esc", "q":
+			m.state = viewHostDetail
+			m.deepScanScrollY = 0
 		}
 
 	// ── Help view ──
@@ -544,6 +608,27 @@ func runPortScan(ip string, isRoot bool) tea.Cmd {
 	}
 }
 
+// runDeepScan returns a BubbleTea command that performs a full deep scan
+// (all TCP ports + UDP high-value ports + -sV + -O + NSE safe scripts) on
+// the target host and sends the result as a deepScanDoneMsg.
+func runDeepScan(ip string, isRoot bool) tea.Cmd {
+	return func() tea.Msg {
+		if err := scanner.ValidateIP(ip); err != nil {
+			return deepScanDoneMsg{err: err}
+		}
+		// 3-minute hard ceiling for the deep scan context.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*60*time.Second)
+		defer cancel()
+
+		result, err := scanner.DeepScan(ctx, ip, isRoot)
+		if err != nil {
+			return deepScanDoneMsg{err: err}
+		}
+		report := risk.AnalyseHostDeep(result.Host)
+		return deepScanDoneMsg{result: result, report: report}
+	}
+}
+
 // ─── View ─────────────────────────────────────────────────────────────────────
 
 // View renders the current UI state as a string.
@@ -559,6 +644,8 @@ func (m Model) View() string {
 		return m.viewHosts()
 	case viewHostDetail:
 		return m.viewHostDetail()
+	case viewDeepScan:
+		return m.viewDeepScan()
 	case viewHelp:
 		return m.viewHelp()
 	default:
@@ -946,15 +1033,30 @@ func (m Model) viewHosts() string {
 		w = 100
 	}
 
+	// Detect the default gateway so we can badge it in the list.
+	gatewayIP := scanner.DetectDefaultGatewayIP()
+
 	header := center(styleTitle.Render("  LAN Host Discovery "), w)
 	subLine := center(
 		styleMuted.Render("Subnet  ")+styleAccent.Render(m.hostCIDR),
 		w,
 	)
+	var gwLine string
+	if gatewayIP != "" {
+		gwLine = center(
+			styleMuted.Render("Gateway ")+
+				styleAccent2.Render("\U0001f4f6 "+gatewayIP+"  (your hotspot / router)"),
+			w,
+		)
+	}
 
 	var sb strings.Builder
 	sb.WriteString(header + "\n")
-	sb.WriteString(subLine + "\n\n")
+	sb.WriteString(subLine + "\n")
+	if gwLine != "" {
+		sb.WriteString(gwLine + "\n")
+	}
+	sb.WriteString("\n")
 
 	if m.hostLoading {
 		sb.WriteString(center(
@@ -1016,6 +1118,11 @@ func (m Model) viewHosts() string {
 		if hostname == "" {
 			hostname = "—"
 		}
+		// Badge the gateway (hotspot / router) with a distinct icon.
+		gatewayBadge := ""
+		if r.Host.IP == gatewayIP {
+			gatewayBadge = styleAccent2.Render(" 📡")
+		}
 
 		row := fmt.Sprintf("%-*s  %-*s  %-*s  %s",
 			wIP, r.Host.IP,
@@ -1025,9 +1132,9 @@ func (m Model) viewHosts() string {
 		)
 
 		if i == m.hostCursor {
-			sb.WriteString(styleSelected.Render("▶ "+row) + "\n")
+			sb.WriteString(styleSelected.Render("▶ "+row) + gatewayBadge + "\n")
 		} else {
-			sb.WriteString("  " + row + "\n")
+			sb.WriteString("  " + row + gatewayBadge + "\n")
 		}
 	}
 
@@ -1143,7 +1250,202 @@ func (m Model) viewHostDetail() string {
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(center(styleHelp.Render("esc · back to host list"), w))
+	sb.WriteString(center(
+		styleHelp.Render("d · deep scan (full ports + versions + scripts)    esc · back to host list"),
+		w))
+	return sb.String()
+}
+
+// ─── Deep scan view ───────────────────────────────────────────────────────────
+
+func (m Model) viewDeepScan() string {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+
+	// Determine the IP to show in the header.
+	ip := ""
+	if m.deepScanReport != nil {
+		ip = m.deepScanReport.Host.IP
+	} else if m.selectedHost != nil {
+		ip = m.selectedHost.Host.IP
+	}
+
+	header := center(styleTitle.Render(fmt.Sprintf("  Deep Scan  %s ", ip)), w)
+
+	var sb strings.Builder
+	sb.WriteString(header + "\n\n")
+
+	if m.deepScanLoading {
+		eta := styleAccent.Render(spinnerFrames[m.spinner] + "  Deep scanning " + ip + " (all 65535 ports + NSE scripts)…")
+		sb.WriteString(center(eta, w) + "\n")
+		sb.WriteString(center(styleMuted.Render("This may take up to 3 minutes — scanning all ports, probing versions, running scripts…"), w) + "\n")
+		if !m.isRoot {
+			sb.WriteString(center(styleWarn.Render("⚠ Running without root: OS detection limited, UDP scan skipped"), w) + "\n")
+		}
+		sb.WriteString("\n" + center(styleHelp.Render("esc · cancel"), w))
+		return sb.String()
+	}
+
+	if m.deepScanError != "" {
+		sb.WriteString(center(styleDanger.Render("✖  Deep scan error: "+m.deepScanError), w) + "\n")
+		sb.WriteString("\n" + center(styleHelp.Render("r · retry    esc · back"), w))
+		return sb.String()
+	}
+
+	if m.deepScanReport == nil {
+		sb.WriteString(center(styleMuted.Render("No results yet."), w) + "\n")
+		return sb.String()
+	}
+
+	h := m.deepScanReport
+
+	// ── Identity panel ──────────────────────────────────────────────────────
+	var infoLines []string
+	if h.Host.Hostname != "" {
+		infoLines = append(infoLines, styleMuted.Render("Hostname   ")+styleNormal.Render(h.Host.Hostname))
+	}
+	if h.Host.MAC != "" {
+		v := h.Host.Vendor
+		if v == "" {
+			v = "Unknown vendor"
+		}
+		infoLines = append(infoLines, styleMuted.Render("MAC        ")+styleNormal.Render(h.Host.MAC+"  ("+v+")"))
+	}
+	if h.Host.OS != "" {
+		osTxt := h.Host.OS
+		if h.Host.OSAccuracy > 0 {
+			osTxt += fmt.Sprintf("  [%d%% confidence]", h.Host.OSAccuracy)
+		}
+		infoLines = append(infoLines, styleMuted.Render("OS         ")+styleNormal.Render(osTxt))
+	}
+	if h.Host.DeviceType != "" {
+		infoLines = append(infoLines, styleMuted.Render("Device     ")+styleAccent.Render(h.Host.DeviceType))
+	}
+	scoreColor := lipgloss.Color(risk.ScoreColor(h.Score))
+	scoreStyle := lipgloss.NewStyle().Foreground(scoreColor).Bold(true)
+	infoLines = append(infoLines,
+		styleMuted.Render("Risk Score ")+
+			scoreStyle.Render(fmt.Sprintf("%d/100  %s", h.Score, risk.ScoreLabel(h.Score))),
+	)
+
+	if len(infoLines) > 0 {
+		infoBox := styleBox.
+			BorderForeground(colorPrimary).
+			Width(min(w-8, 72)).
+			Render(strings.Join(infoLines, "\n"))
+		sb.WriteString(center(infoBox, w) + "\n\n")
+	}
+
+	// ── Port / Service table ─────────────────────────────────────────────────
+	portCount := len(h.Host.OpenPorts)
+	title := fmt.Sprintf("── %d Open Ports (full scan) ──", portCount)
+	sb.WriteString(center(styleAccent.Render(title), w) + "\n\n")
+
+	const (
+		wPort  = 7
+		wProto = 5
+		wSvc   = 14
+		wProd  = 22
+		wVer   = 12
+	)
+
+	if portCount == 0 {
+		sb.WriteString(center(styleMuted.Render("No open ports found in full scan (host may be firewalled)"), w) + "\n")
+	} else {
+		hRow := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
+			wPort, "Port",
+			wProto, "Proto",
+			wSvc, "Service",
+			wProd, "Product",
+			"Version",
+		)
+		div := strings.Repeat("─", min(w-4, 80))
+		sb.WriteString(center(styleMuted.Render(hRow), w) + "\n")
+		sb.WriteString(center(styleFaint.Render(div), w) + "\n")
+
+		// Apply scroll.
+		visible := m.height - 20
+		if visible < 5 {
+			visible = 5
+		}
+		start := m.deepScanScrollY
+		if start >= portCount {
+			start = portCount - 1
+		}
+		if start < 0 {
+			start = 0
+		}
+
+		for i := start; i < portCount && i < start+visible; i++ {
+			p := h.Host.OpenPorts[i]
+			_, isDanger := isDangerousPort(p.Number)
+
+			svc := p.Service
+			if svc == "" {
+				svc = "—"
+			}
+			prod := p.Product
+			if prod == "" {
+				prod = "—"
+			}
+			ver := p.Version
+			if ver == "" {
+				ver = "—"
+			}
+
+			row := fmt.Sprintf("  %-*d  %-*s  %-*s  %-*s  %s",
+				wPort, p.Number,
+				wProto, p.Protocol,
+				wSvc, truncateRunes(svc, wSvc),
+				wProd, truncateRunes(prod, wProd),
+				ver,
+			)
+			if isDanger {
+				sb.WriteString(center(styleDanger.Render(row+"  ⚠"), w) + "\n")
+			} else {
+				sb.WriteString(center(styleNormal.Render(row), w) + "\n")
+			}
+
+			// NSE script output — show first 2 scripts per port inline.
+			for si, s := range p.Scripts {
+				if si >= 2 {
+					break
+				}
+				out := truncateRunes(s.Output, 80)
+				sb.WriteString(center(
+					styleFaint.Render(fmt.Sprintf("    [%s] %s", s.ID, out)),
+					w) + "\n")
+			}
+		}
+
+		if portCount > visible {
+			sb.WriteString(center(
+				styleFaint.Render(fmt.Sprintf("  … %d more  (↓/j to scroll)", portCount-start-visible)),
+				w) + "\n")
+		}
+	}
+
+	// ── Risk findings ────────────────────────────────────────────────────────
+	if len(h.Findings) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString(center(styleAccent2.Render("── Risk Findings ──"), w) + "\n\n")
+		for _, f := range h.Findings {
+			fColor := lipgloss.Color(risk.LevelColor(f.Level))
+			fStyle := lipgloss.NewStyle().Foreground(fColor).Bold(true)
+			titleLine := fStyle.Render("▸ [" + f.Level.String() + "] " + f.Title)
+			descLine := styleMuted.Render("  " + f.Description)
+			sb.WriteString(center(titleLine, w) + "\n")
+			sb.WriteString(center(descLine, w) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(center(
+		styleHelp.Render("↑/k ↓/j  scroll ports    r  re-scan    esc · back"),
+		w,
+	))
 	return sb.String()
 }
 
@@ -1162,9 +1464,10 @@ func (m Model) viewHelp() string {
 	header := center(styleTitle.Render("  Key Bindings "), w)
 
 	bindings := [][2]string{
-		{"↑  /  k", "Move selection up"},
-		{"↓  /  j", "Move selection down"},
+		{"↑  /  k", "Move selection up / scroll"},
+		{"↓  /  j", "Move selection down / scroll"},
 		{"enter  /  space", "Select / activate"},
+		{"d", "Deep scan selected host (host detail view)"},
 		{"r", "Re-run current scan"},
 		{"esc  /  q", "Back / exit current view"},
 		{"ctrl + c", "Quit NOVA immediately"},

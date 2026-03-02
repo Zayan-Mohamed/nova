@@ -34,9 +34,13 @@ The system `ping` binary is typically setuid-root, allowing it to send ICMP pack
 
 NOVA automatically selects your active subnet by:
 
-1. Iterating all network interfaces
-2. Skipping virtual/container interfaces by prefix: `docker`, `br-`, `virbr`, `veth`, `vmnet`, `vboxnet`, `tun`, `tap`, `wg`, `utun`, `vpn`, `dummy`, `bond`, `team`
-3. Using the first real interface with a non-loopback IPv4 address and its **actual subnet mask** (not a forced `/24`)
+1. Reading the OS routing table to find the **default route** interface:
+   - **Linux** — parses `/proc/net/route` and picks the row with destination `0.0.0.0`
+   - **macOS** — runs `route get default` and extracts the interface name
+2. Using the subnet mask of that interface (not a forced `/24`)
+3. Falling back to iterating interfaces and skipping virtual/container prefixes (`docker`, `br-`, `virbr`, `veth`, `vmnet`, `vboxnet`, `tun`, `tap`, `wg`, `utun`, `vpn`, `dummy`, `bond`, `team`) if no default route is found
+
+This ensures NOVA selects the **hotspot / WiFi tethering interface** rather than a Docker bridge or VPN tunnel that may appear earlier in the interface list.
 
 Override with:
 
@@ -48,13 +52,13 @@ nova --subnet 10.10.0.0/16
 
 ## Displayed fields
 
-| Column       | Description                                       |
-| ------------ | ------------------------------------------------- |
-| **IP**       | Host IPv4 address                                 |
-| **Hostname** | Reverse DNS name (or `—` if unresolvable)         |
-| **MAC**      | Hardware address from ARP cache (root: from nmap) |
-| **Vendor**   | NIC manufacturer derived from MAC OUI prefix      |
-| **Score**    | Security score 0–100                              |
+| Column       | Description                                                           |
+| ------------ | --------------------------------------------------------------------- |
+| **IP**       | Host IPv4 address — `📡` badge shown on the default gateway / hotspot |
+| **Hostname** | Reverse DNS name (or `—` if unresolvable)                             |
+| **MAC**      | Hardware address from ARP cache (root: from nmap)                     |
+| **Vendor**   | NIC manufacturer derived from MAC OUI prefix                          |
+| **Score**    | Security score 0–100                                                  |
 
 ---
 

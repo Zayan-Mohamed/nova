@@ -258,6 +258,208 @@ func AnalyseHost(h scanner.Host) HostReport {
 	}
 }
 
+// AnalyseHostDeep extends AnalyseHost with richer findings from a deep scan:
+// service version advisories, device type classification, UDP service risks,
+// SSL certificate expiry hints, and NSE script intelligence.
+func AnalyseHostDeep(h scanner.Host) HostReport {
+	// Start with the standard analysis.
+	report := AnalyseHost(h)
+
+	// --- Device type classification + mobile-hotspot heuristic ---
+	//
+	// Mobile hotspots (Android / iPhone tethering, MiFi devices) show up as
+	// the default gateway with very few open TCP ports because iptables only
+	// lets DNS and DHCP through the tethering interface.  nmap therefore
+	// reports OS as "Linux 2.6.x / 3.x / 4.x" (Android kernel) and device
+	// type as "general purpose" — which is unhelpfully generic.
+	//
+	// We override the classification when the following are ALL true:
+	//   1. The host is marked as the default gateway by DeepScan.
+	//   2. Fewer than 4 TCP ports are open (hotspot firewall blocks the rest).
+	//   3. OS contains a Linux kernel version string.
+	// → Almost certainly a mobile hotspot, not a "general purpose" server.
+	deviceType := strings.ToLower(h.DeviceType)
+	openTCPCount := 0
+	for _, p := range h.OpenPorts {
+		if p.Protocol == "tcp" {
+			openTCPCount++
+		}
+	}
+	isLikelyHotspot := deviceType == "gateway" && openTCPCount <= 4 &&
+		(strings.Contains(strings.ToLower(h.OS), "linux") ||
+			strings.Contains(strings.ToLower(h.OS), "android"))
+
+	if isLikelyHotspot {
+		// Override so the device-type switch below and the UI both see this.
+		h.DeviceType = "mobile hotspot / router"
+		deviceType = "mobile hotspot / router"
+		report.Host.DeviceType = h.DeviceType
+	}
+
+	switch {
+	case deviceType == "mobile hotspot / router" || isLikelyHotspot:
+		report.Findings = append(report.Findings, Finding{
+			Level: LevelInfo,
+			Title: "Mobile Hotspot / Tethering Gateway Detected",
+			Description: fmt.Sprintf(
+				"This device (%s) is the network default gateway and shows "+
+					"characteristics of a mobile hotspot or Android/iOS tethering "+
+					"device (Linux kernel OS, few exposed ports). Ensure no admin "+
+					"interface is reachable from connected clients.", h.IP),
+		})
+	case strings.Contains(deviceType, "router") || strings.Contains(deviceType, "firewall") || strings.Contains(deviceType, "broadband"):
+		report.Findings = append(report.Findings, Finding{
+			Level:       LevelInfo,
+			Title:       "Gateway / Router Detected",
+			Description: fmt.Sprintf("Device type identified as %q. Verify admin interface is not accessible from untrusted networks.", h.DeviceType),
+		})
+	case strings.Contains(deviceType, "phone") || strings.Contains(deviceType, "smartphone"):
+		report.Findings = append(report.Findings, Finding{
+			Level:       LevelInfo,
+			Title:       "Mobile Device / Hotspot Detected",
+			Description: "A mobile device or mobile hotspot was identified. Ensure the tethering admin interface is not exposed.",
+		})
+	case strings.Contains(deviceType, "print") || deviceType == "printer":
+		report.Findings = append(report.Findings, Finding{
+			Level:       LevelMedium,
+			Title:       "Network Printer Detected",
+			Description: "Printers often have weak authentication and can be used as pivot points. Verify admin access is restricted.",
+		})
+	case strings.Contains(deviceType, "webcam") || strings.Contains(deviceType, "media") || strings.Contains(deviceType, "storage"):
+		report.Findings = append(report.Findings, Finding{
+			Level:       LevelMedium,
+			Title:       fmt.Sprintf("IoT / Embedded Device (%s)", h.DeviceType),
+			Description: "Embedded devices frequently run outdated firmware. Check for default credentials and available firmware updates.",
+		})
+	}
+
+	// --- Service version advisories ---
+	for _, p := range h.OpenPorts {
+		// HTTP admin panels (common on routers and mobile hotspots).
+		if (p.Number == 80 || p.Number == 8080 || p.Number == 8888 || p.Number == 7547) &&
+			p.Protocol == "tcp" {
+			for _, s := range p.Scripts {
+				if s.ID == "http-title" && s.Output != "" {
+					report.Findings = append(report.Findings, Finding{
+						Level:       LevelInfo,
+						Title:       fmt.Sprintf("Web Interface Detected (port %d)", p.Number),
+						Description: fmt.Sprintf("Page title: %q. Verify this admin interface requires authentication.", s.Output),
+					})
+				}
+			}
+		}
+
+		// SSL/TLS certificate info.
+		for _, s := range p.Scripts {
+			if s.ID == "ssl-cert" && s.Output != "" {
+				out := s.Output
+				if strings.Contains(strings.ToLower(out), "expired") ||
+					strings.Contains(strings.ToLower(out), "not valid after") {
+					report.Findings = append(report.Findings, Finding{
+						Level:       LevelMedium,
+						Title:       fmt.Sprintf("TLS Certificate Issue (port %d)", p.Number),
+						Description: "The TLS certificate may be expired or self-signed. Details: " + truncate(out, 120),
+					})
+				}
+			}
+
+			// SMB OS discovery.
+			if s.ID == "smb-os-discovery" && s.Output != "" {
+				report.Findings = append(report.Findings, Finding{
+					Level:       LevelInfo,
+					Title:       "SMB OS Details",
+					Description: truncate(s.Output, 160),
+				})
+			}
+
+			// SNMP info — reveals device description.
+			if s.ID == "snmp-info" && s.Output != "" {
+				report.Findings = append(report.Findings, Finding{
+					Level:       LevelMedium,
+					Title:       "SNMP Public Community String Accessible",
+					Description: "SNMP with community string 'public' is responding. Device info: " + truncate(s.Output, 160),
+				})
+			}
+
+			// UPnP info — reveals device model/manufacturer.
+			if s.ID == "upnp-info" && s.Output != "" {
+				report.Findings = append(report.Findings, Finding{
+					Level:       LevelHigh,
+					Title:       "UPnP Service Exposed",
+					Description: "UPnP can allow unauthenticated port-forwarding. Device info: " + truncate(s.Output, 160),
+				})
+			}
+		}
+
+		// Port 7547 (TR-069) — ISP remote management protocol, very dangerous if exposed.
+		if p.Number == 7547 && p.Protocol == "tcp" {
+			report.Findings = append(report.Findings, Finding{
+				Level:       LevelCritical,
+				Title:       "TR-069 (CWMP) Management Port Exposed",
+				Description: "Port 7547 is used by ISPs for remote router management. If exposed to LAN, it may allow unauthorised configuration changes (e.g. Mirai botnet vector).",
+			})
+		}
+
+		// Port 49152+ — common UPnP/SOAP control URLs on consumer routers.
+		if p.Number >= 49152 && p.Number <= 49165 && p.Protocol == "tcp" {
+			report.Findings = append(report.Findings, Finding{
+				Level:       LevelHigh,
+				Title:       fmt.Sprintf("High Dynamic Port %d Open (possible UPnP control)", p.Number),
+				Description: "Dynamic ports in the 49152+ range are commonly used for UPnP SOAP control endpoints on routers and IoT devices.",
+			})
+		}
+
+		// SSH with old version.
+		if p.Service == "ssh" && p.Version != "" {
+			if strings.HasPrefix(p.Version, "6.") || strings.HasPrefix(p.Version, "5.") || strings.HasPrefix(p.Version, "4.") {
+				report.Findings = append(report.Findings, Finding{
+					Level:       LevelHigh,
+					Title:       fmt.Sprintf("Outdated SSH Version (port %d): %s %s", p.Number, p.Product, p.Version),
+					Description: "This SSH version is likely end-of-life and may contain unpatched vulnerabilities. Upgrade the SSH server.",
+				})
+			}
+		}
+
+		// Telnet detected by service version (extra insurance beyond port 23).
+		if strings.Contains(strings.ToLower(p.Service), "telnet") {
+			report.Findings = append(report.Findings, Finding{
+				Level:       LevelCritical,
+				Title:       fmt.Sprintf("Telnet Service Confirmed (port %d)", p.Number),
+				Description: "Telnet transmits all data in plaintext. Disable this service immediately.",
+			})
+		}
+
+		// Default router credentials hint via HTTP server header.
+		if p.Product != "" {
+			pLow := strings.ToLower(p.Product)
+			routerKeywords := []string{"miniupnp", "dnsmasq", "openwrt", "dd-wrt", "tomato", "routeros", "mikrotik", "zyxel", "netgear", "tplink", "tp-link", "asus", "linksys", "dlink", "d-link", "huawei", "zte", "tenda"} //nolint:misspell // routeros is MikroTik's RouterOS product, not a misspelling
+			for _, kw := range routerKeywords {
+				if strings.Contains(pLow, kw) {
+					report.Findings = append(report.Findings, Finding{
+						Level:       LevelMedium,
+						Title:       fmt.Sprintf("Router/AP Software Identified: %s", p.Product),
+						Description: "Check for default credentials and ensure firmware is up to date. Vendor: " + p.Product + " " + p.Version,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	// --- OS confidence advisory ---
+	if h.OS != "" && h.OSAccuracy > 0 && h.OSAccuracy < 85 {
+		report.Findings = append(report.Findings, Finding{
+			Level:       LevelInfo,
+			Title:       fmt.Sprintf("OS Detection Low Confidence (%d%%): %s", h.OSAccuracy, h.OS),
+			Description: "OS fingerprinting confidence is below 85%. The OS guess may be inaccurate.",
+		})
+	}
+
+	// Re-score with the enriched findings.
+	report.Score = scoreHost(report.Findings, h)
+	return report
+}
+
 // scoreHost produces a 0–100 security score for a LAN host.
 func scoreHost(findings []Finding, _ scanner.Host) int {
 	score := 100

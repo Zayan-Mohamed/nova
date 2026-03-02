@@ -59,6 +59,21 @@ Starts at **100**. Deductions depend on open ports and findings:
 
 ---
 
+## Deep scan host analysis
+
+When a Deep Scan completes, `AnalyseHostDeep` runs an extended analysis on top of the standard port-based scoring:
+
+| Finding                                    | Level  | Condition                                               |
+| ------------------------------------------ | ------ | ------------------------------------------------------- |
+| Mobile hotspot / router                    | Info   | Default gateway + Linux OS + ≤ 4 open TCP ports         |
+| Web admin panel exposed                    | Medium | HTTP/HTTPS open on non-standard port (8080, 8443, etc.) |
+| SSL certificate expiry / hostname mismatch | Medium | Detected via `ssl-cert` NSE script output               |
+| SNMP publicly readable                     | High   | Port 161/UDP open (community string `public`)           |
+| UPnP exposed                               | High   | Port 1900/UDP open                                      |
+| TR-069 (CWMP) management port exposed      | High   | Port 7547 open (ISP remote management protocol)         |
+| Outdated SSH version                       | Medium | SSH-1.x detected in banner                              |
+| Router firmware keyword identified         | Info   | Service banner matches OpenWrt, DD-WRT, RouterOS, etc.  |
+
 ## Data flow
 
 ```
@@ -73,6 +88,18 @@ wifi.Network / scanner.Host
         │
         ▼
    ui.viewWiFi / ui.viewHostDetail
+
+
+scanner.DeepScanResult (Host with full ports, OS, scripts)
+        │
+        ▼
+   risk.AnalyseHostDeep()
+        │
+        ▼
+  []Finding (extended)  +  Score (0–100)
+        │
+        ▼
+   ui.viewDeepScan
 ```
 
 The risk package has **no side effects** — it is a pure function that takes scan data and returns findings. It never modifies the network, opens connections, or writes files.
