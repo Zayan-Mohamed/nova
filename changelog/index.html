@@ -1041,6 +1041,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v020-2026-03-03" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [v0.2.0] — 2026-03-03
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[v0.2.0] — 2026-03-03">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#hotspot-gateway-fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hotspot &amp; Gateway Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#code-quality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Code Quality
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#unreleased" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1142,6 +1192,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#v020-2026-03-03" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        [v0.2.0] — 2026-03-03
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="[v0.2.0] — 2026-03-03">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#hotspot-gateway-fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Hotspot &amp; Gateway Fixes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#code-quality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Code Quality
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#unreleased" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1198,6 +1298,31 @@
 <li>GoReleaser v2 for cross-platform binaries (Linux + macOS, amd64 + arm64)</li>
 <li>MkDocs Material documentation published to GitHub Pages</li>
 <li>SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md, issue templates</li>
+</ul>
+<hr />
+<h2 id="v020-2026-03-03">[v0.2.0] — 2026-03-03<a class="headerlink" href="#v020-2026-03-03" title="Permanent link">&para;</a></h2>
+<h3 id="deep-scan">Deep Scan<a class="headerlink" href="#deep-scan" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Deep Scan</strong> (<code>d</code> from Host Detail view) — full Fing-style host intelligence scan:</li>
+<li>All 65 535 TCP ports (<code>-p 1-65535</code>) with service &amp; version detection (<code>-sV --version-intensity 7</code>)</li>
+<li>OS fingerprinting with confidence percentage (<code>-O --osscan-guess</code>)</li>
+<li>NSE safe-script suite: <code>http-title</code>, <code>http-server-header</code>, <code>ssl-cert</code>, <code>ssh-hostkey</code>, <code>smb-os-discovery</code>, <code>dns-service-discovery</code>, <code>banner</code>, <code>snmp-info</code>, <code>upnp-info</code>, <code>nbstat</code></li>
+<li>UDP scan on high-value ports 67 (DHCP), 161 (SNMP), 1900 (UPnP), 5353 (mDNS) — root only</li>
+<li>Extra targeted probe on common admin/IoT ports (7547, 8080, 8081, 8443, 8888, 9090, 49152…) to pierce Android hotspot iptables rules</li>
+<li>Scrollable port table in TUI with inline NSE script output per port</li>
+<li>Deep risk analysis: SSL cert warnings, SNMP/UPnP exposure, TR-069 (port 7547), Telnet/SSH version checks, router firmware identification</li>
+</ul>
+<h3 id="hotspot-gateway-fixes">Hotspot &amp; Gateway Fixes<a class="headerlink" href="#hotspot-gateway-fixes" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Default gateway detection</strong> — <code>defaultCIDR()</code> now reads <code>/proc/net/route</code> (Linux) and <code>route get default</code> (macOS) instead of using interface index order; correctly selects the hotspot interface over Docker/VPN bridges</li>
+<li><strong><code>-Pn</code> flag</strong> added to all Deep Scan TCP arguments so Android hotspot targets are always scanned (Android iptables drops ICMP on the tethering interface by default)</li>
+<li><strong>Gateway badge <code>📡</code></strong> shown in the host list next to the detected default gateway / hotspot router</li>
+<li><strong>Hotspot heuristic</strong> in <code>AnalyseHostDeep</code>: gateway + Linux OS + ≤ 4 open TCP ports → classified as <code>mobile hotspot / router</code></li>
+</ul>
+<h3 id="code-quality">Code Quality<a class="headerlink" href="#code-quality" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Fixed 7 <code>staticcheck QF1012</code> warnings in <code>buildRawSummary</code> — replaced <code>sb.WriteString(fmt.Sprintf(…))</code> with <code>fmt.Fprintf(&amp;sb, …)</code></li>
+<li>Fixed <code>misspell</code> false-positive on <code>"routeros"</code> (MikroTik RouterOS product name) with <code>//nolint:misspell</code></li>
 </ul>
 <hr />
 <h2 id="unreleased">[Unreleased]<a class="headerlink" href="#unreleased" title="Permanent link">&para;</a></h2>

@@ -814,6 +814,95 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#deep-scan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Deep Scan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-runs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it runs
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="What it runs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tcp-full-port-sweep" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TCP full-port sweep
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#udp-high-value-ports-root-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UDP high-value ports (root only)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#adminiot-port-probe-hotspot-bypass" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Admin/IoT port probe (hotspot bypass)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan-tui-view" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan TUI view
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan-timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep scan timeout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1191,6 +1280,95 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#deep-scan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Deep Scan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-it-runs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it runs
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="What it runs">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tcp-full-port-sweep" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TCP full-port sweep
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#udp-high-value-ports-root-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        UDP high-value ports (root only)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#adminiot-port-probe-hotspot-bypass" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Admin/IoT port probe (hotspot bypass)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan-tui-view" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep Scan TUI view
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#deep-scan-timeout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep scan timeout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1369,6 +1547,70 @@
 <li>nmap is required to be installed; NOVA does not bundle or download it</li>
 <li>NOVA never performs exploit probes — only service version detection (<code>-sV</code>)</li>
 </ul>
+<hr />
+<h2 id="deep-scan">Deep Scan<a class="headerlink" href="#deep-scan" title="Permanent link">&para;</a></h2>
+<p>Press <code>d</code> from the Host Detail view to run a <strong>Deep Scan</strong> — a comprehensive, Fing-style host intelligence pass that goes far beyond the default 1–1024 port range.</p>
+<h3 id="what-it-runs">What it runs<a class="headerlink" href="#what-it-runs" title="Permanent link">&para;</a></h3>
+<h4 id="tcp-full-port-sweep">TCP full-port sweep<a class="headerlink" href="#tcp-full-port-sweep" title="Permanent link">&para;</a></h4>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>nmap {-sS|-sT} -Pn [-O] --osscan-guess \
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>  -sV --version-intensity 7 \
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  --script http-title,http-server-header,ssl-cert,ssh-hostkey,\
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>           smb-os-discovery,dns-service-discovery,banner,\
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>           snmp-info,upnp-info,nbstat \
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>  --open -p 1-65535 -T4 --host-timeout 120s -oX - &lt;ip&gt;
+</span></code></pre></div>
+<ul>
+<li><code>-Pn</code> — skips host-discovery ICMP probes; essential for <strong>mobile hotspots</strong> where Android iptables drops ICMP on the tethering interface</li>
+<li><code>-O</code> / <code>--osscan-guess</code> — OS fingerprinting with confidence percentage (root only)</li>
+<li>NSE scripts are limited to the <strong><code>safe</code></strong> and <strong><code>discovery</code></strong> categories — no <code>exploit</code>, <code>brute</code>, or <code>dos</code> scripts ever run</li>
+</ul>
+<h4 id="udp-high-value-ports-root-only">UDP high-value ports (root only)<a class="headerlink" href="#udp-high-value-ports-root-only" title="Permanent link">&para;</a></h4>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>nmap -sU -Pn -p 67,161,1900,5353 -T4 --host-timeout 30s -oX - &lt;ip&gt;
+</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Service</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>67</td>
+<td>DHCP</td>
+<td>Confirms device is acting as a gateway</td>
+</tr>
+<tr>
+<td>161</td>
+<td>SNMP</td>
+<td>Device description, firmware, uptime</td>
+</tr>
+<tr>
+<td>1900</td>
+<td>UPnP</td>
+<td>Unauthenticated port-forward capability</td>
+</tr>
+<tr>
+<td>5353</td>
+<td>mDNS</td>
+<td>Bonjour/Avahi service advertisement</td>
+</tr>
+</tbody>
+</table>
+<h4 id="adminiot-port-probe-hotspot-bypass">Admin/IoT port probe (hotspot bypass)<a class="headerlink" href="#adminiot-port-probe-hotspot-bypass" title="Permanent link">&para;</a></h4>
+<p>A targeted TCP connect scan is run against ports commonly used by router admin panels and IoT devices that would otherwise be blocked by Android hotspot iptables rules:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>80, 443, 7547, 8080, 8081, 8443, 8888, 9090, 4040, 5985, 49152, 49153
+</span></code></pre></div>
+<h3 id="deep-scan-tui-view">Deep Scan TUI view<a class="headerlink" href="#deep-scan-tui-view" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Identity panel</strong> — hostname, MAC + vendor, OS with confidence %, device type, risk score</li>
+<li><strong>Full port table</strong> — all 65 535 ports, scrollable with <code>↑</code>/<code>↓</code>; dangerous ports highlighted in red <code>⚠</code></li>
+<li><strong>Inline NSE output</strong> — up to 2 script results shown per port (e.g. HTTP title, SSL CN, SSH key fingerprint)</li>
+<li><strong>Risk findings</strong> — deep analysis findings listed with severity and description</li>
+</ul>
+<h3 id="deep-scan-timeout">Deep scan timeout<a class="headerlink" href="#deep-scan-timeout" title="Permanent link">&para;</a></h3>
+<p>The deep scan allows up to <strong>3 minutes</strong> total. A spinner and ETA message are shown during the scan. Root mode is faster (SYN scan); non-root uses TCP connect and skips UDP and raw OS detection.</p>
 
 
 

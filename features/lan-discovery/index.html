@@ -1236,10 +1236,13 @@
 <h2 id="subnet-auto-detection">Subnet auto-detection<a class="headerlink" href="#subnet-auto-detection" title="Permanent link">&para;</a></h2>
 <p>NOVA automatically selects your active subnet by:</p>
 <ol>
-<li>Iterating all network interfaces</li>
-<li>Skipping virtual/container interfaces by prefix: <code>docker</code>, <code>br-</code>, <code>virbr</code>, <code>veth</code>, <code>vmnet</code>, <code>vboxnet</code>, <code>tun</code>, <code>tap</code>, <code>wg</code>, <code>utun</code>, <code>vpn</code>, <code>dummy</code>, <code>bond</code>, <code>team</code></li>
-<li>Using the first real interface with a non-loopback IPv4 address and its <strong>actual subnet mask</strong> (not a forced <code>/24</code>)</li>
+<li>Reading the OS routing table to find the <strong>default route</strong> interface:</li>
+<li><strong>Linux</strong> — parses <code>/proc/net/route</code> and picks the row with destination <code>0.0.0.0</code></li>
+<li><strong>macOS</strong> — runs <code>route get default</code> and extracts the interface name</li>
+<li>Using the subnet mask of that interface (not a forced <code>/24</code>)</li>
+<li>Falling back to iterating interfaces and skipping virtual/container prefixes (<code>docker</code>, <code>br-</code>, <code>virbr</code>, <code>veth</code>, <code>vmnet</code>, <code>vboxnet</code>, <code>tun</code>, <code>tap</code>, <code>wg</code>, <code>utun</code>, <code>vpn</code>, <code>dummy</code>, <code>bond</code>, <code>team</code>) if no default route is found</li>
 </ol>
+<p>This ensures NOVA selects the <strong>hotspot / WiFi tethering interface</strong> rather than a Docker bridge or VPN tunnel that may appear earlier in the interface list.</p>
 <p>Override with:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>nova<span class="w"> </span>--subnet<span class="w"> </span><span class="m">10</span>.10.0.0/16
 </span></code></pre></div>
@@ -1255,7 +1258,7 @@
 <tbody>
 <tr>
 <td><strong>IP</strong></td>
-<td>Host IPv4 address</td>
+<td>Host IPv4 address — <code>📡</code> badge shown on the default gateway / hotspot</td>
 </tr>
 <tr>
 <td><strong>Hostname</strong></td>

@@ -804,6 +804,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#deep-scan-host-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep scan host analysis
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-flow" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1125,6 +1136,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#deep-scan-host-analysis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deep scan host analysis
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#data-flow" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1312,6 +1334,59 @@
 </tbody>
 </table>
 <hr />
+<h2 id="deep-scan-host-analysis">Deep scan host analysis<a class="headerlink" href="#deep-scan-host-analysis" title="Permanent link">&para;</a></h2>
+<p>When a Deep Scan completes, <code>AnalyseHostDeep</code> runs an extended analysis on top of the standard port-based scoring:</p>
+<table>
+<thead>
+<tr>
+<th>Finding</th>
+<th>Level</th>
+<th>Condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mobile hotspot / router</td>
+<td>Info</td>
+<td>Default gateway + Linux OS + ≤ 4 open TCP ports</td>
+</tr>
+<tr>
+<td>Web admin panel exposed</td>
+<td>Medium</td>
+<td>HTTP/HTTPS open on non-standard port (8080, 8443, etc.)</td>
+</tr>
+<tr>
+<td>SSL certificate expiry / hostname mismatch</td>
+<td>Medium</td>
+<td>Detected via <code>ssl-cert</code> NSE script output</td>
+</tr>
+<tr>
+<td>SNMP publicly readable</td>
+<td>High</td>
+<td>Port 161/UDP open (community string <code>public</code>)</td>
+</tr>
+<tr>
+<td>UPnP exposed</td>
+<td>High</td>
+<td>Port 1900/UDP open</td>
+</tr>
+<tr>
+<td>TR-069 (CWMP) management port exposed</td>
+<td>High</td>
+<td>Port 7547 open (ISP remote management protocol)</td>
+</tr>
+<tr>
+<td>Outdated SSH version</td>
+<td>Medium</td>
+<td>SSH-1.x detected in banner</td>
+</tr>
+<tr>
+<td>Router firmware keyword identified</td>
+<td>Info</td>
+<td>Service banner matches OpenWrt, DD-WRT, RouterOS, etc.</td>
+</tr>
+</tbody>
+</table>
 <h2 id="data-flow">Data flow<a class="headerlink" href="#data-flow" title="Permanent link">&para;</a></h2>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>wifi.Network / scanner.Host
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>        │
@@ -1324,6 +1399,18 @@
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>        │
 </span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>        ▼
 </span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>   ui.viewWiFi / ui.viewHostDetail
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>scanner.DeepScanResult (Host with full ports, OS, scripts)
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>        │
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>        ▼
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>   risk.AnalyseHostDeep()
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>        │
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>        ▼
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>  []Finding (extended)  +  Score (0–100)
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>        │
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>        ▼
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>   ui.viewDeepScan
 </span></code></pre></div>
 <p>The risk package has <strong>no side effects</strong> — it is a pure function that takes scan data and returns findings. It never modifies the network, opens connections, or writes files.</p>
 
